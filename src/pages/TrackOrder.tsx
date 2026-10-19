@@ -14,6 +14,7 @@ import {
 } from "../lib/documentPdf";
 import { Download, Loader2 } from "lucide-react";
 import toast from "react-hot-toast";
+import { PayOnlineButton } from "../components/PayOnlineButton";
 
 export function TrackOrder() {
   const [input, setInput] = useState("");
@@ -289,6 +290,20 @@ export function TrackOrder() {
                     ? "Preparing…"
                     : "Download Order Summary"}
                 </button>
+                {/* Signed-in results carry payment_status; a guest's do not,
+                    and razorpay-order itself refuses an order already paid. */}
+                {order.status !== "Cancelled" && order.payment_status !== "received" && (
+                  <PayOnlineButton
+                    orderId={order.id}
+                    phone={order.phone || phone}
+                    onPaid={(r) =>
+                      setOrders((list) =>
+                        list.map((o) => (o.id === order.id ? { ...o, payment_status: r.payment_status } : o))
+                      )
+                    }
+                    className="mt-2"
+                  />
+                )}
               </div>
             ))}
           </div>

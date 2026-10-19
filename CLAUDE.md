@@ -111,6 +111,16 @@ public/assets/       images; banners in img/banners/
 - **Payments.** `src/lib/paymentDetails.ts` holds the UPI ID and QR path. Both
   are empty until the shop's own account is set, and the pay screens hide the
   UPI/QR blocks while they are.
+- **Online payment (Razorpay).** The browser never sends an amount. It names
+  an order plus the phone it was placed with; the `razorpay-order` edge
+  function asks `razorpay_prepare_payment()` what is due *from the database*
+  and creates the Razorpay order; `razorpay-verify` (HMAC of
+  `order_id|payment_id`) and `razorpay-webhook` (HMAC of the raw body) both
+  call `razorpay_mark_paid()`, which is idempotent, so a payment enters the
+  `order_payments` ledger once. Those SQL functions are service_role only.
+  Every customer order goes through `create_guest_order` (server-priced, also
+  for signed-in customers); customers cannot insert `orders` directly.
+  `PayOnlineButton` renders only when `VITE_RAZORPAY_KEY_ID` is set.
 - **Order tracking.** `track_guest_order(reference, phone)` needs both halves —
   sequential order numbers alone would let anyone page through every order.
   The reference may be the full number, the row uuid, or just the last 4

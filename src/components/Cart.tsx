@@ -15,8 +15,8 @@ import {
 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import { useEffect, useState, useRef } from "react";
-import { createOrder } from "../hooks/useOrders";
 import { createGuestOrder } from "../lib/guestOrders";
+import { PayOnlineButton } from "./PayOnlineButton";
 import { supabase } from "../lib/supabase";
 import toast from "react-hot-toast";
 import confetti from "canvas-confetti";
@@ -86,6 +86,9 @@ export function Cart({ isOpen, onClose }: CartProps) {
   const [otpError, setOtpError] = useState("");
   const [isVerifying, setIsVerifying] = useState(false);
   const [lastOrderId, setLastOrderId] = useState<string | null>(null);
+  // What online payment needs: the order, the phone it was placed with, and
+  // the total the database priced it at.
+  const [placedOrder, setPlacedOrder] = useState<{ id: string; phone: string; total: number } | null>(null);
   const { user, userRole } = useAuth();
   const navigate = useNavigate();
   const [statesList, setStatesList] = useState<{ id: number; name: string }[]>(
@@ -526,46 +529,24 @@ export function Cart({ isOpen, onClose }: CartProps) {
       //   }
       // }
 
-      // Create order. A pack line carries the pack rather than a product —
-      // the database expands it into its contents when it moves the stock.
-      const orderItems = items.map((item) => ({
-        product_id: item.is_pack ? null : item.id,
-        combo_pack_id: item.is_pack ? item.id : null,
-        quantity: item.quantity,
-        price: item.offer_price,
-        total_price: item.totalPrice,
-      }));
-
-      // Create order and get the order data (with id)
-      let orderData: { id: string; short_id?: string | null };
-
-      if (currentUser) {
-        orderData = await createOrder({
-          total_amount: totalAmount,
-          payment_method: paymentMethod,
-          items: orderItems,
-          delivery_details: clean,
-          season_id: activeSeason?.id ?? null,
-        });
-        setGuestOrderRef(null);
-      } else {
-        const guestOrder = await createGuestOrder({
-          delivery: clean,
-          items: items.map((item) => ({
-            product_id: item.is_pack ? null : item.id,
-            combo_pack_id: item.is_pack ? item.id : null,
-            quantity: item.quantity,
-          })),
-          paymentMethod,
-        });
-        orderData = { id: guestOrder.id, short_id: guestOrder.short_id };
-        // A guest has no My Orders to come back to, so the order number is
-        // put in front of them and kept on the device.
-        setGuestOrderRef({
-          short_id: guestOrder.short_id,
-          phone: clean.phone,
-        });
-      }
+      // Every order is priced by the database (create_guest_order), signed in
+      // or not; with a session it is attached to the account. Inserting the
+      // order from here, as signed-in checkout once did, let the browser set
+      // its own prices, and online payment charges the order's total.
+      const placed = await createGuestOrder({
+        delivery: clean,
+        items: items.map((item) => ({
+          product_id: item.is_pack ? null : item.id,
+          combo_pack_id: item.is_pack ? item.id : null,
+          quantity: item.quantity,
+        })),
+        paymentMethod,
+      });
+      const orderData = { id: placed.id, short_id: placed.short_id };
+      // A guest has no My Orders to come back to, so the order number is put
+      // in front of them and kept on the device.
+      setGuestOrderRef(currentUser ? null : { short_id: placed.short_id, phone: clean.phone });
+      setPlacedOrder({ id: placed.id, phone: clean.phone, total: Number(placed.total_amount) });
 
       setLastOrderId(orderData.id);
 
@@ -592,7 +573,8 @@ export function Cart({ isOpen, onClose }: CartProps) {
           price: item.offer_price,
           total: item.totalPrice,
         })),
-        subtotal: totalAmount,
+        // The database's total, which is what the customer will be charged.
+        subtotal: Number(placed.total_amount),
         paymentMethod,
         business: businessFromSettings(appSettings),
       };
@@ -1003,6 +985,14 @@ export function Cart({ isOpen, onClose }: CartProps) {
                       Track this order
                     </a>
                   </div>
+                )}
+                {placedOrder && (
+                  <PayOnlineButton
+                    orderId={placedOrder.id}
+                    phone={placedOrder.phone}
+                    amount={placedOrder.total}
+                    className="mb-5 max-w-sm mx-auto"
+                  />
                 )}
                 {orderSummary && (
                   <div className="mb-4">

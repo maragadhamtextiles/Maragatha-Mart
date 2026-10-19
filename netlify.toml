@@ -1,0 +1,54 @@
+# Netlify: build the Vite app and serve dist/. The VITE_* variables are read
+# at build time, so a Netlify-side build needs them set under
+# Site configuration → Environment variables (see README). A CLI deploy of a
+# local build (`netlify deploy --prod`) uses the local .env instead.
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# Rules apply in order, first match wins, so the host redirect comes first.
+# www → apex, so search engines see one site (src/lib/site.ts).
+[[redirects]]
+  from = "https://www.maragathamart.com/*"
+  to = "https://maragathamart.com/:splat"
+  status = 301
+  force = true
+
+# Any path the app routes itself (/silks, /shop, /product/…) gets index.html.
+# Real files, including the pre-rendered dist/blog/* pages, still win: Netlify
+# only applies a rewrite when no file matches. All redirects live here: a
+# public/_redirects file would be applied before these and shadow the www rule.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# Vite fingerprints everything under /assets/ built from src, so those can be
+# cached for a year. Photos in public/assets keep their names, so they get a
+# day, revalidated after.
+[[headers]]
+  for = "/assets/*.js"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+[[headers]]
+  for = "/assets/*.css"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+[[headers]]
+  for = "/assets/img/*"
+  [headers.values]
+    Cache-Control = "public, max-age=86400, stale-while-revalidate=604800"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    X-Frame-Options = "SAMEORIGIN"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=()"

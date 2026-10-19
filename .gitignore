@@ -1,0 +1,50 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+Thumbs.db
+
+# Secrets. Was tracked once by mistake; keep it out for good.
+.env
+
+# Left over from the Bolt.new scaffold; nothing reads it.
+.bolt/
+
+# Agent skills installed per machine with `npx skills add`.
+.agents/
+.claude/skills/
+skills-lock.json
+
+# Supabase CLI working state: which project this machine is linked to, and
+# the local stack's scratch files. Per-developer, never shared.
+supabase/.temp/
+supabase/.branches/
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# Netlify CLI link state for this machine.
+.netlify/
+
+# Claude Code per-machine settings.
+.claude/settings.local.json

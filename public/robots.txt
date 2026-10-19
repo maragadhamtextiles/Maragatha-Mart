@@ -1,0 +1,24 @@
+User-agent: *
+Allow: /
+
+# Sitemap
+Sitemap: https://maragathamart.com/sitemap.xml
+
+# Admin and private, signed-in-only routes
+Disallow: /admin/
+Disallow: /profile
+Disallow: /myorders
+Disallow: /orders
+Disallow: /dashboard
+Disallow: /stock
+Disallow: /family-packs
+Disallow: /settings
+Disallow: /users
+Disallow: /analytics
+Disallow: /expenses
+Disallow: /customers
+Disallow: /vendors
+Disallow: /seasons
+Disallow: /purchasing
+Disallow: /update-password
+Disallow: /api/

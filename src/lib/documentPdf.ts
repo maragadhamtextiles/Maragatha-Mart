@@ -1,0 +1,329 @@
+import { jsPDF } from "jspdf";
+import autoTable from "jspdf-autotable";
+import { format } from "date-fns";
+import { loadImage } from "./priceListPdf";
+import type { BusinessDetails } from "./businessDetails";
+
+/**
+ * Invoices and quotations as PDF files.
+ *
+ * The printed invoice is an HTML page sent to the print dialog, which is fine
+ * on paper but gives you nothing to send anyone. Sharing on WhatsApp needs a
+ * real file, so both documents are drawn here with the same layout: business
+ * on the left, document number and date on the right, customer, items,
+ * totals.
+ */
+
+export interface DocumentLine {
+  /**
+   * The product code, printed in a column of its own. Optional: a quotation
+   * goes to a customer who has no use for our internal codes, so it leaves
+   * this out and the column is not drawn at all.
+   */
+  code?: string | null;
+  name: string;
+  quantity: number;
+  price: number;
+  total: number;
+}
+
+export interface DocumentParty {
+  name: string;
+  phone?: string | null;
+  email?: string | null;
+  address?: string | null;
+  city?: string | null;
+  district?: string | null;
+  state?: string | null;
+  pincode?: string | null;
+}
+
+export interface BusinessDocument {
+  /**
+   * "order" is the summary a customer gets the moment they check out: the
+   * order exists but nothing is confirmed or paid yet, so it is neither a
+   * bill nor a quotation.
+   */
+  kind: "invoice" | "quotation" | "order";
+  number: string;
+  date: string | Date;
+  status?: string | null;
+  customer: DocumentParty;
+  lines: DocumentLine[];
+  /** Sum of the lines, before any discount. */
+  subtotal: number;
+  discount?: number;
+  paymentMethod?: string | null;
+  business: BusinessDetails;
+}
+
+/** The rupee sign is not in the standard PDF fonts; see priceListPdf. */
+const amount = (value: number) =>
+  Number(value || 0).toLocaleString("en-IN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+
+/** Emerald (#0A4A31) for headings and the table head; gold (#C9A227) for the rule under the header. */
+const BRAND: [number, number, number] = [10, 74, 49];
+const GOLD: [number, number, number] = [201, 162, 39];
+
+export async function buildDocumentPdf(doc: BusinessDocument): Promise<jsPDF> {
+  const pdf = new jsPDF({ orientation: "portrait", unit: "pt", format: "a4" });
+  const pageWidth = pdf.internal.pageSize.getWidth();
+  const pageHeight = pdf.internal.pageSize.getHeight();
+  const margin = 36;
+  const right = pageWidth - margin;
+
+  const { business } = doc;
+  const isInvoice = doc.kind === "invoice";
+  const isOrder = doc.kind === "order";
+  // The GST switch is about invoices. A quotation or an order summary is not
+  // a tax document, so it never claims to be one.
+  const showGst = isInvoice && business.showGst && !!business.gstin;
+
+  // ---- header --------------------------------------------------------------
+  //
+  // The logo stands alone on the left; the shop's own details, the document
+  // number and the date all sit together against the right edge. Splitting
+  // the business between a left column and a right one -- which is what this
+  // was -- read as two different letterheads on one page.
+  let leftY = margin;
+  const logo = await loadImage("/assets/img/logo/logo_2.png");
+  if (logo) {
+    const height = 62;
+    const width = (logo.width / logo.height) * height;
+    pdf.addImage(logo.dataUrl, margin, leftY, width, height, undefined, "FAST");
+    leftY += height + 8;
+  }
+
+  let rightY = margin;
+  pdf.setFont("helvetica", "bold");
+  pdf.setFontSize(20);
+  pdf.setTextColor(BRAND[0], BRAND[1], BRAND[2]);
+  pdf.text(
+    isInvoice
+      ? showGst ? "TAX INVOICE" : "INVOICE"
+      : isOrder ? "ORDER SUMMARY" : "QUOTATION",
+    right,
+    rightY + 18,
+    { align: "right" }
+  );
+  rightY += 32;
+
+  pdf.setTextColor(30);
+  pdf.setFontSize(12);
+  pdf.text(business.name, right, rightY, { align: "right" });
+  rightY += 15;
+
+  pdf.setFont("helvetica", "normal");
+  pdf.setFontSize(9);
+  pdf.setTextColor(80);
+  const businessLines = [
+    ...(business.address ? pdf.splitTextToSize(business.address, 260) : []),
+    ...(business.state ? [business.state] : []),
+    // Contact lines come from Admin Settings; one not filled in is left off.
+    ...(business.phone ? [`Phone: ${business.phone}`] : []),
+    ...(business.email ? [`Email: ${business.email}`] : []),
+  ] as string[];
+  businessLines.forEach((line) => {
+    pdf.text(line, right, rightY, { align: "right" });
+    rightY += 12;
+  });
+  if (showGst) {
+    pdf.setFont("helvetica", "bold");
+    pdf.setTextColor(30);
+    pdf.text(`GSTIN: ${business.gstin}`, right, rightY, { align: "right" });
+    rightY += 12;
+    pdf.setFont("helvetica", "normal");
+  }
+
+  rightY += 4;
+  pdf.setFontSize(9);
+  pdf.setTextColor(60);
+  const meta: [string, string][] = [
+    [isInvoice || isOrder ? "Order No" : "Quote No", doc.number],
+    ["Date", format(new Date(doc.date), "dd MMM yyyy, h:mm a")],
+  ];
+  if (doc.status) meta.push(["Status", doc.status]);
+  meta.forEach(([label, value]) => {
+    // The label is placed off the width of its own value so that the pair
+    // ends flush right whatever the number or date happens to be.
+    pdf.setFont("helvetica", "bold");
+    const valueWidth = pdf.getTextWidth(value);
+    pdf.text(value, right, rightY, { align: "right" });
+    pdf.setFont("helvetica", "normal");
+    pdf.text(`${label}:`, right - valueWidth - 6, rightY, { align: "right" });
+    rightY += 13;
+  });
+
+  let y = Math.max(leftY, rightY) + 10;
+  pdf.setDrawColor(GOLD[0], GOLD[1], GOLD[2]);
+  pdf.setLineWidth(1.5);
+  pdf.line(margin, y, right, y);
+  y += 18;
+
+  // ---- customer ------------------------------------------------------------
+  const c = doc.customer;
+  const column = (title: string, lines: string[], x: number) => {
+    pdf.setFont("helvetica", "bold");
+    pdf.setFontSize(10);
+    pdf.setTextColor(30);
+    pdf.text(title, x, y);
+    pdf.setFont("helvetica", "normal");
+    pdf.setFontSize(9);
+    pdf.setTextColor(70);
+    let lineY = y + 14;
+    lines.forEach((line) => {
+      (pdf.splitTextToSize(line, 240) as string[]).forEach((part) => {
+        pdf.text(part, x, lineY);
+        lineY += 12;
+      });
+    });
+    return lineY;
+  };
+
+  const billTo = [c.name, c.phone ? `Phone: ${c.phone}` : "", c.email && c.email !== "-" ? c.email : ""]
+    .filter(Boolean);
+  const placeLine = [c.city, c.district, c.state].filter(Boolean).join(", ");
+  const shipTo = [c.address ?? "", placeLine, c.pincode ? `PIN: ${c.pincode}` : ""].filter(Boolean);
+
+  const endLeft = column(
+    isInvoice ? "Bill To" : isOrder ? "Customer" : "Quotation For",
+    billTo,
+    margin
+  );
+  const endRight = shipTo.length
+    ? column("Delivery Address", shipTo, pageWidth / 2 + 10)
+    : y;
+  y = Math.max(endLeft, endRight) + 8;
+
+  // ---- items ---------------------------------------------------------------
+  const totalQuantity = doc.lines.reduce((sum, line) => sum + (line.quantity || 0), 0);
+
+  // The code column only earns its width when there is something to put in
+  // it; without it the product name gets those 62 points instead.
+  const withCode = doc.lines.some((line) => line.code);
+
+  autoTable(pdf, {
+    startY: y,
+    head: [
+      withCode
+        ? ["S.No", "Code", "Product", "Qty", "Price (Rs.)", "Total (Rs.)"]
+        : ["S.No", "Product", "Qty", "Price (Rs.)", "Total (Rs.)"],
+    ],
+    body: doc.lines.map((line, index) =>
+      [
+        String(index + 1),
+        ...(withCode ? [line.code ?? "-"] : []),
+        line.name,
+        String(line.quantity),
+        amount(line.price),
+        amount(line.total),
+      ]
+    ),
+    // The totals row carries its own alignment on the cell. A columnStyles
+    // entry outranks footStyles in autotable, so the product column's
+    // left-aligned body setting was pulling these two totals off centre.
+    foot: [
+      [
+        ...(withCode ? ["", ""] : [""]),
+        { content: `${doc.lines.length} products`, styles: { halign: "center" as const } },
+        { content: String(totalQuantity), styles: { halign: "center" as const } },
+        "",
+        "",
+      ],
+    ],
+    margin: { left: margin, right: margin, bottom: 50 },
+    theme: "grid",
+    styles: { font: "helvetica", fontSize: 8.5, cellPadding: 4, lineColor: [215, 215, 215], lineWidth: 0.4 },
+    headStyles: { fillColor: BRAND, textColor: 255, fontStyle: "bold", halign: "center" },
+    footStyles: { fillColor: [248, 248, 248], textColor: 60, fontStyle: "bold" },
+    columnStyles: withCode
+      ? {
+          0: { cellWidth: 32, halign: "center" },
+          1: { cellWidth: 62 },
+          3: { cellWidth: 40, halign: "center" },
+          4: { cellWidth: 70, halign: "right" },
+          5: { cellWidth: 78, halign: "right" },
+        }
+      : {
+          0: { cellWidth: 32, halign: "center" },
+          2: { cellWidth: 40, halign: "center" },
+          3: { cellWidth: 70, halign: "right" },
+          4: { cellWidth: 78, halign: "right" },
+        },
+  });
+
+  // ---- totals --------------------------------------------------------------
+  const tableEnd =
+    (pdf as unknown as { lastAutoTable?: { finalY: number } }).lastAutoTable?.finalY ?? y;
+  let totalsY = tableEnd + 18;
+  const discount = Number(doc.discount || 0);
+  const grand = doc.subtotal - discount;
+
+  const needed = (discount > 0 ? 3 : 1) * 16 + 60;
+  if (totalsY + needed > pageHeight - 50) {
+    pdf.addPage();
+    totalsY = margin + 10;
+  }
+
+  const totalRow = (label: string, value: string, bold = false) => {
+    pdf.setFont("helvetica", bold ? "bold" : "normal");
+    pdf.setFontSize(bold ? 11 : 9.5);
+    pdf.setTextColor(bold ? 20 : 60);
+    pdf.text(label, right - 190, totalsY);
+    pdf.text(value, right, totalsY, { align: "right" });
+    totalsY += bold ? 18 : 15;
+  };
+
+  if (discount > 0) {
+    totalRow("Total", `Rs. ${amount(doc.subtotal)}`);
+    totalRow("Discount", `- Rs. ${amount(discount)}`);
+  }
+  totalRow("Grand Total", `Rs. ${amount(grand)}`, true);
+  if (doc.paymentMethod) totalRow("Payment method", doc.paymentMethod);
+
+  if (!isInvoice) {
+    pdf.setFont("helvetica", "italic");
+    pdf.setFontSize(8.5);
+    pdf.setTextColor(110);
+    pdf.text(
+      isOrder
+        ? "This is an order summary, not a bill. Our team will contact you to confirm the order and payment."
+        : "This is a quotation, not a bill. Prices are valid subject to stock availability.",
+      margin,
+      totalsY + 10
+    );
+  }
+
+  // ---- footer on every page -------------------------------------------------
+  const pages = pdf.getNumberOfPages();
+  for (let page = 1; page <= pages; page++) {
+    pdf.setPage(page);
+    pdf.setFont("helvetica", "normal");
+    pdf.setFontSize(8);
+    pdf.setTextColor(120);
+    pdf.text(
+      [`Thank you for choosing ${business.name}`, business.website, business.phone]
+        .filter(Boolean)
+        .join("  |  "),
+      pageWidth / 2,
+      pageHeight - 24,
+      { align: "center" }
+    );
+    if (pages > 1) {
+      pdf.text(`Page ${page} of ${pages}`, right, pageHeight - 24, { align: "right" });
+    }
+  }
+
+  return pdf;
+}
+
+/** A file name a phone will not mangle. */
+export function documentFileName(kind: BusinessDocument["kind"], number: string) {
+  const safe = number.replace(/[^A-Za-z0-9-]+/g, "_");
+  const prefix =
+    kind === "invoice" ? "Invoice" : kind === "order" ? "Order_Summary" : "Quotation";
+  return `${prefix}_${safe}.pdf`;
+}

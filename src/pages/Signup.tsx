@@ -1,0 +1,326 @@
+import { useState } from "react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import { motion } from "framer-motion";
+import { User, Mail, Phone, Lock, LogIn, CheckCircle2, XCircle, AlertTriangle, ArrowRight } from "lucide-react";
+import { useAuth } from "../context/AuthContext";
+import { OTPVerification } from "../components/OTPVerification";
+import toast from "react-hot-toast";
+import { z } from "zod";
+
+const emailSchema = z.string().email("Invalid email format");
+const phoneSchema = z.string().regex(/^[6-9]\d{9}$/, "Invalid phone number");
+
+const signupSchema = z
+  .object({
+    name: z.string().min(2, "Name must be at least 2 characters"),
+    email: z.string(),
+    phone: z.string().regex(/^[6-9]\d{9}$/, "Invalid phone number"),
+    password: z.string().min(6, "Password must be at least 6 characters"),
+  })
+  .superRefine((data, ctx) => {
+    const isEmail = emailSchema.safeParse(data.email).success;
+    const isPhone = phoneSchema.safeParse(data.email).success;
+
+    if (!isEmail && !isPhone) {
+      ctx.addIssue({
+        path: ["identifier"],
+        code: z.ZodIssueCode.custom,
+        message: "Must be a valid email or phone number",
+      });
+    }
+  });
+
+export function Signup() {
+  const [formData, setFormData] = useState({
+    name: "",
+    email: "",
+    phone: "",
+    password: "",
+  });
+  const [isLoading, setIsLoading] = useState(false);
+  const [showOTPVerification, setShowOTPVerification] = useState(false);
+  const [verificationId, setVerificationId] = useState("");
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  /**
+   * Where to go after signing in, or after skipping.
+   *
+   * Checkout sends customers here with the page they came from, so both
+   * outcomes put them back at their cart rather than on the home page with an
+   * order half-placed. Anything that is not a local path is ignored, so a
+   * crafted link cannot use this to bounce someone off-site.
+   */
+  const rawReturnTo = (location.state as { from?: string } | null)?.from;
+  const returnTo =
+    typeof rawReturnTo === "string" &&
+    rawReturnTo.startsWith("/") &&
+    !rawReturnTo.startsWith("//")
+      ? rawReturnTo
+      : "/";
+  const { signUp, signInWithPhone, checkExistingUser } = useAuth();
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const { name, value } = e.target;
+    setFormData((prev) => ({ ...prev, [name]: value }));
+  };
+
+  function showToast(type: "success" | "error" | "warning", message: string) {
+    const icon =
+      type === "success"
+        ? <CheckCircle2 className="text-green-600 w-5 h-5 mr-2" />
+        : type === "error"
+        ? <XCircle className="text-red-600 w-5 h-5 mr-2" />
+        : <AlertTriangle className="text-yellow-500 w-5 h-5 mr-2" />;
+    toast(
+      <span className="flex items-center">{icon}{message}</span>,
+      {
+        duration: 6000,
+        icon: null,
+        style: {
+          background: type === "success"
+            ? "#e6ffed"
+            : type === "error"
+            ? "#ffeaea"
+            : "#fffbe5",
+          color: "#222",
+        },
+      }
+    );
+  }
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsLoading(true);
+
+    try {
+      // Validate form data
+      signupSchema.parse(formData);
+
+      // Check if user exists
+      const existingUser = await checkExistingUser(
+        formData.email,
+        formData.phone
+      );
+      if (existingUser.exists) {
+        showToast("error", existingUser.message || "User already exists.");
+        throw new Error(existingUser.message);
+      }
+
+      // Skip OTP verification for now
+      handleVerified();
+      // Uncomment below lines to enable OTP verification
+
+      // Send OTP for verification
+      // const { verificationId: vId, error: verificationError } = await signInWithPhone(formData.phone);
+
+      // if (verificationError) throw verificationError;
+      // if (!vId) throw new Error('Failed to send verification code');
+
+      // setVerificationId(vId);
+      // setShowOTPVerification(true);
+      // toast.success('Verification code sent successfully!');
+    } catch (error: any) {
+      console.error(error);
+      showToast(
+        "error",
+        error.message && !error.message.startsWith("Failed")
+          ? "Could not sign up. Please check your details."
+          : "Failed to sign up. Please try again."
+      );
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleVerified = async () => {
+    try {
+      setIsLoading(true);
+
+      // Create user account
+      const { error: signUpError } = await signUp({
+        email: formData.email,
+        password: formData.password,
+        phone: formData.phone,
+        name: formData.name,
+      });
+
+      if (signUpError) throw signUpError;
+
+      navigate(returnTo);
+      showToast(
+        "success",
+        "Account created & you are now logged in! Start shopping for your favorites."
+      );
+    } catch (error: any) {
+      console.error(error);
+      showToast("error", "Failed to create account. Please try again.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen pt-8 pb-12 flex items-center justify-center">
+      <div className="container mx-auto px-4">
+        <div className="max-w-md mx-auto">
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.5 }}
+            className="card"
+          >
+            <div className="text-center mb-8">
+              <h1 className="font-heading text-4xl mb-2">Create Account</h1>
+              <p className="text-text/60">Sign up to get started</p>
+            </div>
+
+            <form onSubmit={handleSubmit} className="space-y-6">
+              <div>
+                <label className="block text-sm font-medium mb-2">
+                  Full Name
+                </label>
+                <div className="relative">
+                  <input
+                    type="text"
+                    name="name"
+                    value={formData.name}
+                    onChange={handleChange}
+                    className="w-full pl-10 pr-4 py-2 rounded-lg bg-background border border-card-border/10 focus:outline-none focus:border-primary-orange"
+                    placeholder="Enter your full name"
+                    disabled={isLoading}
+                  />
+                  <User className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-text/40" />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium mb-2">Email</label>
+                <div className="relative">
+                  <input
+                    type="text"
+                    name="email"
+                    value={formData.email}
+                    onChange={handleChange}
+                    className="w-full pl-10 pr-4 py-2 rounded-lg bg-background border border-card-border/10 focus:outline-none focus:border-primary-orange"
+                    placeholder="Enter your email or phone number"
+                    disabled={isLoading}
+                  />
+                  <Mail className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-text/40" />
+                </div>
+                <p className="text-xs text-text/60 mt-1">
+                  Order details and status updates will be sent to this email.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium mb-2">
+                  Phone Number
+                </label>
+                <div className="relative">
+                  <input
+                    type="tel"
+                    name="phone"
+                    value={formData.phone}
+                    onChange={handleChange}
+                    pattern="[6-9]\d{9}"
+                    className="w-full pl-10 pr-4 py-2 rounded-lg bg-background border border-card-border/10 focus:outline-none focus:border-primary-orange"
+                    placeholder="Enter 10-digit mobile number"
+                    disabled={isLoading}
+                  />
+                  <Phone className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-text/40" />
+                </div>
+                <p className="text-xs text-text/60 mt-1">
+                  A verification code will be sent to this number while placing
+                  order.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium mb-2">
+                  Password
+                </label>
+                <div className="relative">
+                  <input
+                    type="password"
+                    name="password"
+                    value={formData.password}
+                    onChange={handleChange}
+                    className="w-full pl-10 pr-4 py-2 rounded-lg bg-background border border-card-border/10 focus:outline-none focus:border-primary-orange"
+                    placeholder="Create a password"
+                    disabled={isLoading}
+                  />
+                  <Lock className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-text/40" />
+                </div>
+                <p className="text-xs text-text/60 mt-1">
+                  Must be at least 6 characters
+                </p>
+              </div>
+
+              <button
+                type="submit"
+                disabled={isLoading}
+                className="btn-primary w-full flex items-center justify-center"
+              >
+                {isLoading ? (
+                  <span className="animate-pulse">Processing...</span>
+                ) : (
+                  <>
+                    <LogIn className="w-5 h-5 mr-2" />
+                    <span>Sign Up</span>
+                  </>
+                )}
+              </button>
+            </form>
+
+            <div className="mt-6 text-center">
+              <p className="text-text/60">
+                Already have an account?{" "}
+                <Link
+                  to="/login"
+                  state={{ from: returnTo }}
+                  className="text-primary-orange hover:text-primary-red"
+                >
+                  Sign In
+                </Link>
+              </p>
+            </div>
+
+            {/* Signing in is optional. Skipping returns to whatever page sent
+                the customer here — the cart, normally — with everything in it
+                still there, so they can check out as a guest. */}
+            <div className="mt-6 pt-5 border-t border-card-border/10 text-center">
+              <button
+                type="button"
+                onClick={() => navigate(returnTo)}
+                className="inline-flex items-center gap-2 text-text/70 hover:text-primary-orange font-semibold transition-colors"
+              >
+                <span>Skip for now</span>
+                <ArrowRight className="w-4 h-4" />
+              </button>
+              <p className="text-xs text-text/50 mt-1">
+                Continue without an account — you can still place and track an
+                order.
+              </p>
+            </div>
+          </motion.div>
+
+          <div className="mt-8 text-center">
+            <Link to="/" className="text-primary-orange hover:text-primary-red">
+              Back to Home
+            </Link>
+          </div>
+        </div>
+      </div>
+
+      {showOTPVerification && (
+        <OTPVerification
+          phone={formData.phone}
+          verificationId={verificationId}
+          onVerified={handleVerified}
+          onCancel={() => setShowOTPVerification(false)}
+        />
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,51 @@
+{
+  "name": "Maragatha Mart",
+  "short_name": "Maragatha",
+  "description": "Silk sarees from Maragatha Silks and everyday essentials. Shop and track your order.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "lang": "en",
+  "dir": "ltr",
+  "theme_color": "#003620",
+  "background_color": "#FDFBF5",
+  "icons": [
+    {
+      "src": "/assets/img/favicon/android-chrome-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/assets/img/favicon/android-chrome-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/assets/img/favicon/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Silk Sarees",
+      "short_name": "Silks",
+      "url": "/silks"
+    },
+    {
+      "name": "Shop",
+      "short_name": "Shop",
+      "url": "/shop"
+    },
+    {
+      "name": "Track Order",
+      "short_name": "Track",
+      "url": "/track-order"
+    }
+  ]
+}

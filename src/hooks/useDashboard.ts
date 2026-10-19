@@ -1,0 +1,499 @@
+import { useState, useEffect, useRef } from "react";
+import { supabase } from "../lib/supabase";
+import { format, startOfDay, endOfDay } from "date-fns";
+import { DashboardStats } from "../types";
+import { revenueSummary, SALE_STATUSES, statusOf, type RevenueSummary } from "../lib/revenueStages";
+import { personNameKey } from "../lib/personName";
+
+/** The Expenses tile: what went out in the period, by person and by type. */
+export interface ExpenseSummary {
+  /** Everything but credits -- the same total the Expenses page reports as spend. */
+  total: number;
+  byUser: { name: string; amount: number }[];
+  /** Every type, credits included, so the tile can be checked against the page. */
+  byType: { type: string; amount: number }[];
+}
+
+const EMPTY_REVENUE: RevenueSummary = {
+  totalRevenue: 0,
+  revenueByStage: [],
+  amountReceived: 0,
+  averageOrderValue: 0,
+  expectedRevenue: 0,
+  expectedByStage: [],
+};
+
+export function useDashboard() {
+  const [stats, setStats] = useState<DashboardStats>({
+    totalOrders: 0,
+    totalUsers: 0,
+    totalRevenue: 0,
+    totalProfit: 0,
+    amountReceived: 0,
+    discountGiven: 0,
+  });
+
+  const [salesData, setSalesData] = useState({
+    labels: [] as string[],
+    datasets: [
+      {
+        label: "Sales",
+        data: [] as number[],
+        borderColor: "#FF5722",
+        tension: 0.4,
+      },
+    ],
+  });
+
+  const [categoryData, setCategoryData] = useState({
+    labels: [] as string[],
+    datasets: [
+      {
+        data: [] as number[],
+        backgroundColor: [
+          "#FF5722", // Deep Orange
+          "#FFC107", // Amber
+          "#FF0000", // Red
+          "#8A2BE2", // Blue Violet
+          "#4CAF50", // Green
+          "#00BCD4", // Cyan
+          "#E91E63", // Pink
+          "#9C27B0", // Purple
+          "#3F51B5", // Indigo
+          "#2196F3", // Blue
+          "#009688", // Teal
+          "#CDDC39", // Lime
+          "#FF9800", // Orange
+          "#795548", // Brown
+          "#607D8B", // Blue Grey
+          "#000000", // Black
+        ],
+      },
+    ],
+  });
+
+  // Inventory / SKUs charts state
+  const [topSkusChart, setTopSkusChart] = useState({
+    labels: [] as string[],
+    datasets: [{ label: "Revenue", data: [] as number[], backgroundColor: "#FF5722" }],
+  });
+  const [lowStockChart, setLowStockChart] = useState({
+    labels: [] as string[],
+    datasets: [{ label: "Stock", data: [] as number[], backgroundColor: "#E53E3E" }],
+  });
+  const [inventorySummary, setInventorySummary] = useState({
+    lowStockList: [] as any[],
+    outOfStockCount: 0,
+  });
+
+  const [revenue, setRevenue] = useState<RevenueSummary>(EMPTY_REVENUE);
+  const [expenses, setExpenses] = useState<ExpenseSummary>({ total: 0, byUser: [], byType: [] });
+
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Only the newest request may write the tiles. Switching season, or a
+  // realtime refresh landing mid-load, used to let an older, slower answer
+  // arrive last and overwrite the season on screen.
+  const latestRequest = useRef(0);
+
+  /** The range currently on screen, so realtime refreshes reuse it. */
+  const lastRangeRef = useRef<{
+    startDate: Date;
+    endDate: Date;
+    seasonId?: string | null;
+  } | null>(null);
+
+  // Inventory figures always describe some season. When a rolling date preset
+  // is selected there is no season in the range, so use the live one.
+  const resolveActiveSeasonId = async (): Promise<string | null> => {
+    const { data } = await supabase
+      .from("seasons")
+      .select("id")
+      .eq("status", "active")
+      .maybeSingle();
+    return data?.id ?? null;
+  };
+
+  /**
+   * @param range  Resolved window from useDateRange. When it carries a
+   *               seasonId the query filters on orders.season_id, which is
+   *               exact — date maths across the April 1 boundary is not.
+   */
+  const fetchDashboardData = async (
+    range: {
+      startDate: Date;
+      endDate: Date;
+      seasonId?: string | null;
+    } = {
+      startDate: startOfDay(new Date(2020, 0, 1)),
+      endDate: endOfDay(new Date(2100, 11, 31)),
+    }
+  ) => {
+    const request = ++latestRequest.current;
+    const isStale = () => request !== latestRequest.current;
+    try {
+      setLoading(true);
+      lastRangeRef.current = range;
+
+      const startDate = startOfDay(range.startDate);
+      const endDate = endOfDay(range.endDate);
+      const seasonId = range.seasonId ?? null;
+
+      // consider only completed orders for revenue/profit/sales
+      const COMPLETED_STATUSES = ["shipped", "dispatched", "delivered"];
+
+      // Cost comes from order_items.apr_snapshot — frozen when the order was
+      // placed. Joining live product cost made historical profit change every
+      // time a price was edited.
+      let ordersQuery = supabase
+        .from("orders")
+        .select(
+          `
+          *,
+          order_items:order_items (
+            price,
+            quantity,
+            apr_snapshot,
+            combo_pack_id,
+            product:products ( id, name ),
+            pack:combo_packs ( id, name )
+          )
+        `
+        );
+
+      if (seasonId) {
+        ordersQuery = ordersQuery.eq("season_id", seasonId);
+      } else {
+        ordersQuery = ordersQuery
+          .gte("created_at", startDate.toISOString())
+          .lte("created_at", endDate.toISOString());
+      }
+
+      const { data: orders, error: ordersError } = await ordersQuery;
+
+      if (ordersError) throw ordersError;
+
+      // completed orders (case-insensitive)
+      const completedOrders = (orders || []).filter((o: any) =>
+        COMPLETED_STATUSES.includes((o.status || "").toString().toLowerCase())
+      );
+
+      // Revenue is what the customer pays: the order total less its discount.
+      // Profit below already took the discount off, so counting the gross
+      // here made revenue and profit disagree by every discount given.
+      const netAmount = (order: any) =>
+        Math.max(Number(order.total_amount || 0) - Number(order.discount_amt || 0), 0);
+
+      // Calculate total revenue from completed orders
+      const revenue =
+        (completedOrders || []).reduce((sum, order) => sum + netAmount(order), 0) || 0;
+
+      // Calculate total profit based on APR, price, qty and discount (completed orders)
+      const profit =
+        (completedOrders || []).reduce((sum, order) => {
+          if (!order.order_items) return sum;
+          const orderProfit = order.order_items.reduce(
+            (itemSum: number, item: any) => {
+              const price = Number(item.price) || 0;
+              const apr = Number(item.apr_snapshot) || 0;
+              const qty = Number(item.quantity) || 0;
+              return itemSum + (price - apr) * qty;
+            },
+            0
+          );
+          const discount = Number(order.discount_amt) || 0;
+          return sum + (orderProfit - discount);
+        }, 0) || 0;
+
+      // Money in hand is counted on every live order, whatever its stage:
+      // advances arrive long before anything ships. amount_received is
+      // already measured against the discounted total (order_payment_status()
+      // settles an order at total - discount), so the discount is NOT taken
+      // off again here -- doing so would count it twice.
+      const liveOrders = (orders || []).filter(
+        (o: any) => (o.status || "").toString().toLowerCase() !== "cancelled"
+      );
+      const amountReceived = liveOrders.reduce(
+        (sum, o: any) => sum + Number(o.amount_received || 0),
+        0
+      );
+      const discountGiven = liveOrders.reduce(
+        (sum, o: any) => sum + Number(o.discount_amt || 0),
+        0
+      );
+
+      // Fetch the customer role id first
+      const { data: roles, error: rolesError } = await supabase
+        .from("roles")
+        .select("id")
+        .eq("name", "customer")
+        .single();
+
+      if (rolesError || !roles)
+        throw rolesError || new Error("Customer role not found");
+      const customerRoleId = roles.id;
+
+      // Now count users with that role_id
+      const { count: userCount, error: usersError } = await supabase
+        .from("user_profiles")
+        .select("*", { count: "exact", head: true })
+        .eq("role_id", customerRoleId);
+
+      if (usersError) throw usersError;
+
+      // Expenses for the same period. A failure here leaves the tile empty
+      // rather than blanking the whole dashboard.
+      const { data: expenseRows, error: expensesError } = await supabase
+        .from("expenses")
+        .select("spend_by, amount, type")
+        .gte("date", startDate.toISOString())
+        .lte("date", endDate.toISOString());
+      if (expensesError) console.warn("Expenses for the dashboard failed:", expensesError);
+
+      if (isStale()) return;
+
+      setRevenue(revenueSummary(orders || []));
+      setExpenses(summariseExpenses(expenseRows || []));
+
+      setStats({
+        // keep totalOrders as total fetched orders in range (matches analytics)
+        totalOrders: orders?.length || 0,
+        totalUsers: userCount || 0,
+        totalRevenue: revenue,
+        totalProfit: profit,
+        amountReceived,
+        discountGiven,
+      });
+
+      // Prepare sales data (use completed orders)
+      // Key by ISO date so we can sort chronologically, then format labels for display
+      const salesByIsoDate = (completedOrders || []).reduce((acc, order) => {
+        const iso = format(new Date(order.created_at), "yyyy-MM-dd");
+        acc[iso] = (acc[iso] || 0) + netAmount(order);
+        return acc;
+      }, {} as Record<string, number>);
+
+      const sortedDates = Object.keys(salesByIsoDate).sort(); // ISO strings sort chronologically
+      const labels = sortedDates.map((d) => format(new Date(d), "MMM dd"));
+      const dataPoints = sortedDates.map((d) => salesByIsoDate[d]);
+
+      setSalesData({
+        labels,
+        datasets: [
+          {
+            label: "Sales",
+            data: dataPoints,
+            borderColor: "#FF5722",
+            tension: 0.4,
+          },
+        ],
+      });
+
+      // Fetch category data with product count from products table
+      const { data: categories, error: categoriesError } = await supabase.from(
+        "categories"
+      ).select(`
+          name,
+          products:products (
+            id
+          )
+        `);
+
+      if (categoriesError) throw categoriesError;
+
+      if (categories) {
+        setCategoryData({
+          labels: categories.map((cat) => cat.name),
+          datasets: [
+            {
+              data: categories.map((cat) => cat.products.length),
+              backgroundColor: [
+                "#FF5722", // Deep Orange
+                "#FFC107", // Amber
+                "#FF0000", // Red
+                "#8A2BE2", // Blue Violet
+                "#4CAF50", // Green
+                "#00BCD4", // Cyan
+                "#E91E63", // Pink
+                "#9C27B0", // Purple
+                "#3F51B5", // Indigo
+                "#2196F3", // Blue
+                "#009688", // Teal
+                "#CDDC39", // Lime
+                "#FF9800", // Orange
+                "#795548", // Brown
+                "#607D8B", // Blue Grey
+                "#000000", // Black
+              ],
+            },
+          ],
+        });
+      }
+
+      // --- Inventory & Top SKUs (charts)
+      // Stock is per-season, so these read the selected season, falling back to
+      // whichever season is live when a rolling date preset is in use.
+      try {
+        const inventorySeasonId = seasonId ?? (await resolveActiveSeasonId());
+
+        // low stock products (fetch a small set)
+        const { data: products } = await supabase
+          .from("season_catalog")
+          .select("id,name,product_code,stock,reorder_level")
+          .eq("season_id", inventorySeasonId ?? "")
+          .eq("is_active", true)
+          .order("stock", { ascending: true })
+          .limit(20);
+
+        const lowStockList = (products || []).filter((p: any) => {
+          const rl = Number(p.reorder_level ?? 5);
+          const st = Number(p.stock ?? 0);
+          return st <= Math.max(rl, 5);
+        });
+
+        const { count: outOfStockCount } = await supabase
+          .from("season_catalog")
+          .select("id", { count: "exact", head: true })
+          .eq("season_id", inventorySeasonId ?? "")
+          .eq("is_active", true)
+          .eq("stock", 0);
+
+        // build low stock chart (top 8 lowest stock)
+        const lowForChart = (products || [])
+          .slice(0, 8)
+          .map((p: any) => ({ name: p.name || `#${p.id}`, stock: Number(p.stock ?? 0) }));
+
+        if (isStale()) return;
+        setLowStockChart({
+          labels: lowForChart.map((l) => l.name),
+          datasets: [{ label: "Stock", data: lowForChart.map((l) => l.stock), backgroundColor: "#E53E3E" }],
+        });
+
+        // Top SKUs by revenue, from the very orders fetched above -- so they
+        // are exactly the selected season or dates, by the same filter as the
+        // tiles. They used to come from a second query on order_items, which
+        // could disagree with it, and enquiries and cancelled orders counted
+        // as sales. Only confirmed-onward orders count now.
+        const revMap: Record<string, { name: string; revenue: number; qty: number }> = {};
+        (orders || [])
+          .filter((o: any) => SALE_STATUSES.includes(statusOf(o)))
+          .forEach((o: any) =>
+            (o.order_items || []).forEach((it: any) => {
+              // A family pack sells as itself, so it ranks as its own line here
+              // rather than disappearing into "unknown".
+              const pid = it.product?.id ?? it.pack?.id ?? "unknown";
+              const name =
+                it.product?.name ??
+                (it.pack?.name ? `${it.pack.name} (pack)` : `#${pid}`);
+              const qty = Number(it.quantity) || 0;
+              const amount = (Number(it.price) || 0) * qty;
+              if (!revMap[pid]) revMap[pid] = { name, revenue: 0, qty: 0 };
+              revMap[pid].revenue += amount;
+              revMap[pid].qty += qty;
+            })
+          );
+
+        const topSkus = Object.values(revMap).sort((a, b) => b.revenue - a.revenue);
+        if (isStale()) return;
+        setTopSkusChart({
+          labels: topSkus.map((s) => `${s.name} (Sold: ${s.qty})`),
+          datasets: [{ label: "Revenue", data: topSkus.map((s) => Math.round(s.revenue)), backgroundColor: "#FF8A65" }],
+        });
+
+        setInventorySummary({ lowStockList, outOfStockCount: Number(outOfStockCount || 0) });
+      } catch (e) {
+        console.warn("inventory/topSkus calculation failed", e);
+        // keep charts empty but don't throw
+      }
+    } catch (err) {
+      if (!isStale()) setError(err instanceof Error ? err.message : "An error occurred");
+    } finally {
+      if (!isStale()) setLoading(false);
+    }
+  };
+
+  // Set up realtime subscription for orders
+  useEffect(() => {
+    const subscription = supabase
+      .channel("dashboard-changes")
+      .on(
+         "postgres_changes",
+         {
+           event: "*",
+           schema: "public",
+           table: "orders",
+         },
+        () => {
+          // Refresh using whatever range is currently displayed. This used to
+          // call fetchDashboardData() with no arguments, which silently fell
+          // back to all-time — so any order change wiped out the selected
+          // season's figures.
+          if (lastRangeRef.current) {
+            fetchDashboardData(lastRangeRef.current);
+          }
+        }
+       )
+       .subscribe();
+
+    // No initial fetch here. The page owns the first fetch and issues it once
+    // the season list has settled; firing an all-time request here as well
+    // produced two in-flight responses that could land out of order.
+
+    return () => {
+      supabase.removeChannel(subscription);
+    };
+  }, []);
+
+  return {
+    stats,
+    revenue,
+    expenses,
+    salesData,
+    categoryData,
+    topSkusChart,
+    lowStockChart,
+    inventorySummary,
+    loading,
+    error,
+    fetchDashboardData,
+  };
+}
+
+/**
+ * Every spelling of one person's name is one person (see lib/personName),
+ * shown under the spelling they use most.
+ */
+function summariseExpenses(rows: any[]): ExpenseSummary {
+  const users = new Map<string, { amount: number; spellings: Map<string, number> }>();
+  const types = new Map<string, number>();
+  let total = 0;
+
+  rows.forEach((row) => {
+    const amount = Number(row.amount || 0);
+    const type = String(row.type || "other");
+    types.set(type, (types.get(type) || 0) + amount);
+    if (type === "credit") return;
+
+    total += amount;
+    const label = String(row.spend_by ?? "").trim() || "Unknown";
+    const key = personNameKey(label) || label.toLowerCase();
+    const entry = users.get(key) ?? { amount: 0, spellings: new Map<string, number>() };
+    entry.amount += amount;
+    entry.spellings.set(label, (entry.spellings.get(label) || 0) + 1);
+    users.set(key, entry);
+  });
+
+  return {
+    total,
+    byUser: [...users.values()]
+      .map((u) => ({
+        name: [...u.spellings.entries()].sort((a, b) => b[1] - a[1])[0][0],
+        amount: u.amount,
+      }))
+      .sort((a, b) => b.amount - a.amount),
+    byType: [...types.entries()]
+      .map(([type, amount]) => ({ type, amount }))
+      .sort((a, b) => b.amount - a.amount),
+  };
+}

@@ -1,0 +1,243 @@
+import { motion } from "framer-motion";
+import {
+  ArrowRight,
+  Star,
+  Plus,
+  Minus,
+  ShoppingCart,
+  AlertCircle,
+  Loader2,
+} from "lucide-react";
+import { Link } from "react-router-dom";
+import { useCartStore } from "../store/cartStore";
+import { useProducts } from "../hooks/useProducts";
+import { useState, useEffect } from "react";
+import { ProductImageSlider } from "../components/ProductImageSlider";
+import { NumberInput } from "./NumberInput";
+import { productImageUrl } from "../lib/productImage";
+
+export function TrendingProducts() {
+  const { addToCart, items } = useCartStore();
+  const { products, loading: productsLoading } = useProducts();
+  const [trendingProducts, setTrendingProducts] = useState(products);
+  const [quantities, setQuantities] = useState<Record<string, number>>({});
+  const [productStock, setProductStock] = useState<Record<string, number>>({});
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (products.length > 0) {
+      // Get first 4 products for trending section
+      const trending = products.filter((product)=>{return product.product_type === 'trending'}).slice(0, 4);
+      setTrendingProducts(trending);
+
+      // Initialize quantities
+      const newQuantities: Record<string, number> = {};
+      trending.forEach(p => {
+        newQuantities[p.id] = quantities[p.id] || 0;
+      });
+      setQuantities(newQuantities);
+
+      // Stock comes straight off the season catalog now. useProducts already
+      // subscribes to product_seasons and refetches on change, so the separate
+      // stock query and subscription this component used to run were redundant.
+      const stockMap: Record<string, number> = {};
+      trending.forEach(p => {
+        stockMap[p.id] = p.stock;
+      });
+      setProductStock(stockMap);
+      setLoading(false);
+    }else{
+      setTrendingProducts([]);
+      setQuantities({});
+      setProductStock({});
+      setLoading(false);
+    }
+  }, [products]);
+
+  // set initial quantities for trending products if it exists in cart
+  useEffect(() => {
+    if (products.length > 0) {
+      const initialQuantities: Record<string, number> = {};
+      products.forEach(product => {
+        const cartItem = items.find(item => item.id === product.id);
+        if (cartItem) {
+          initialQuantities[product.id] = cartItem.quantity;
+        }
+      });
+      setQuantities(initialQuantities);
+    }
+  }, [products]);
+
+  const handleQuantityChange = (productId: string, value: string) => {
+    const newQuantity = Math.max(0, parseInt(value) || 0);
+    setQuantities((prev) => ({ ...prev, [productId]: newQuantity }));
+  };
+
+  const handleIncrement = (product: any) => {
+    const stock = productStock[product.id];
+    if (stock !== undefined && stock <= 0) {
+      return;
+    }
+
+    const currentQuantity = quantities[product.id] || 0;
+    const newQuantity = currentQuantity + 1;
+    setQuantities((prev) => ({ ...prev, [product.id]: newQuantity }));
+    addToCart(product, 1);
+  };
+
+  const handleDecrement = (product: any) => {
+    const currentQuantity = quantities[product.id] || 0;
+    if (currentQuantity > 0) {
+      const newQuantity = currentQuantity - 1;
+      setQuantities((prev) => ({ ...prev, [product.id]: newQuantity }));
+      addToCart(product, -1);
+    }
+  };
+
+  const handleAddToCart = (product: any) => {
+    const stock = productStock[product.id];
+    if (stock !== undefined && stock <= 0) {
+      return;
+    }
+    setQuantities((prev) => ({ ...prev, [product.id]: 1 }));
+    addToCart(product, 1);
+  };
+
+  if (productsLoading || loading) {
+    return (
+      <div className="py-24 flex items-center justify-center">
+        <Loader2 className="w-8 h-8 animate-spin text-primary-orange" />
+      </div>
+    );
+  }
+
+  // Nothing is marked trending yet: leave the space to the sections around it
+  // rather than show an empty heading.
+  if (trendingProducts.length === 0) return null;
+
+  return (
+    <section className="py-14 md:py-20 bg-card/40">
+      <div className="container mx-auto px-4 sm:px-6">
+        <h2 className="section-title mb-3">Trending Now</h2>
+        <div className="ornament mb-4">✦</div>
+        <div className="flex justify-center mb-10">
+          <Link
+            to="/shop"
+            className="flex items-center gap-2 text-primary-orange hover:text-primary-red transition-colors font-semibold"
+          >
+            <span>View all products</span>
+            <ArrowRight className="w-4 h-4" />
+          </Link>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
+          {trendingProducts.map((product) => (
+            <motion.div
+              key={product.id}
+              initial={{ opacity: 0, y: 20 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.5 }}
+              className="card group p-3 flex flex-col"
+            >
+              <div className="relative mb-4 overflow-hidden rounded-lg">
+                <Link to={`/product/${product.id}`}>
+                  <ProductImageSlider
+                    images={
+                      product.image_url
+                        ? product.image_url.split(',').map((img: string) => productImageUrl(img.trim()))
+                        : [`/assets/img/logo/logo-product.png`]
+                    }
+                    alt={product.name}
+                    className="w-full h-50 object-cover rounded-lg"
+                  />
+                </Link>
+                <div className="absolute top-2 right-2 bg-brand-gold text-brand-emerald font-bold px-2 py-1 rounded-full text-xs">
+                  {product.discount_percentage}% OFF
+                </div>
+                {productStock[product.id] !== undefined && productStock[product.id] <= 0 && (
+                  <div className="absolute inset-0 bg-black/60 flex items-center justify-center">
+                    <div className="bg-red-500 text-white px-4 py-2 rounded-lg font-bold">
+                      OUT OF STOCK
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="flex-1 flex flex-col">
+                <Link to={`/product/${product.id}`}>
+                  <h3 className="font-montserrat font-bold text-lg mb-1">
+                    {product.name}
+                  </h3>
+                </Link>
+                <p className="text-sm text-text/60 mb-1">
+                  {product.categories?.name}
+                </p>
+                <div className="flex items-center justify-between mb-4">
+                  <p className="text-sm text-text/60">{product.content}</p>
+                  <div>
+                    <p className="text-sm text-text/60 line-through">
+                      ₹{product.actual_price}
+                    </p>
+                    <p className="font-bold text-primary-orange">
+                      ₹{product.offer_price}
+                    </p>
+                  </div>
+                </div>
+                <div className="mt-auto">
+                  {quantities[product.id] ? (
+                    <div className="flex items-center justify-center space-x-2">
+                      <button
+                        onClick={() => handleDecrement(product)}
+                        className="p-1 rounded-lg bg-card hover:bg-card/70 transition-colors"
+                        aria-label="Decrease quantity"
+                        disabled={productStock[product.id] !== undefined && productStock[product.id] <= 0}
+                      >
+                        <Minus className="w-4 h-4" />
+                      </button>
+                      <NumberInput
+                        min="0"
+                        value={quantities[product.id] || 0}
+                        onValueChange={(n) => handleQuantityChange(product.id, String(n))}
+                        className="w-16 px-2 py-1 text-center rounded-lg bg-background border border-card-border/10 focus:outline-none focus:border-primary-orange"
+                        aria-label="Quantity"
+                        disabled={productStock[product.id] !== undefined && productStock[product.id] <= 0}
+                      />
+                      <button
+                        onClick={() => handleIncrement(product)}
+                        className="p-1 rounded-lg bg-card hover:bg-card/70 transition-colors"
+                        aria-label="Increase quantity"
+                        disabled={productStock[product.id] !== undefined && productStock[product.id] <= 0}
+                      >
+                        <Plus className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => handleAddToCart(product)}
+                      className={`btn-primary w-full flex items-center justify-center space-x-2 py-2 rounded-lg transition-colors ${
+                        productStock[product.id] !== undefined && productStock[product.id] <= 0
+                          ? "bg-red-500/10 text-white-500 cursor-not-allowed"
+                          : "bg-primary-orange text-white hover:bg-primary-red"
+                      }`}
+                      disabled={productStock[product.id] !== undefined && productStock[product.id] <= 0}
+                    >
+                      {productStock[product.id] !== undefined && productStock[product.id] <= 0 ? (
+                        <>
+                          <AlertCircle className="w-4 h-4" />
+                          <span>Out of Stock</span>
+                        </>
+                      ) : (
+                        <>
+                          <ShoppingCart className="w-4 h-4" />
+                          <span>Add to Cart</span>
+                        </>
+                      )}
+                    </button>
+                  )}
+                </div>
+              </div>
+            </motion.div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}

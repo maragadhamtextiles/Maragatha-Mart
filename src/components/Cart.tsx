@@ -1,0 +1,1872 @@
+import { motion } from "framer-motion";
+import {
+  X,
+  QrCode,
+  Wallet,
+  Loader2,
+  Trash2,
+  LogIn,
+  UserPlus,
+  ArrowRight,
+  Copy,
+  Check,
+  Download,
+  MessageCircle,
+} from "lucide-react";
+import { useAuth } from "../context/AuthContext";
+import { useEffect, useState, useRef } from "react";
+import { createOrder } from "../hooks/useOrders";
+import { createGuestOrder } from "../lib/guestOrders";
+import { supabase } from "../lib/supabase";
+import toast from "react-hot-toast";
+import confetti from "canvas-confetti";
+import { useNavigate } from "react-router-dom";
+import Select from "react-select";
+import { useCartStore, type DeliveryDetailsState } from "../store/cartStore";
+import { useQuotations } from "../hooks/useQuotations";
+import { useSeasons } from "../context/SeasonContext";
+import { NumberInput } from "./NumberInput";
+import { CustomerPhoneLookup } from "./CustomerPhoneLookup";
+import { cleanDelivery, deliveryProblem } from "../lib/deliveryDetails";
+import { CustomerMatch, customerOrderExtras } from "../lib/customerLookup";
+import { productImageUrl } from "../lib/productImage";
+import { useAppSettings } from "../context/AppSettingsContext";
+import { businessFromSettings } from "../lib/businessDetails";
+import {
+  buildDocumentPdf,
+  documentFileName,
+  type BusinessDocument,
+} from "../lib/documentPdf";
+import {
+  WhatsAppShareDialog,
+  type WhatsAppShareRequest,
+} from "./WhatsAppShareDialog";
+import { UPI_ID, PAYMENT_QR } from "../lib/paymentDetails";
+import { addPrintToolbar } from "../lib/printWindow";
+import { whatsappNumber } from "../lib/whatsappShare";
+import { BRAND } from "../config/brand";
+
+interface CartProps {
+  isOpen: boolean;
+  onClose: () => void;
+}
+
+export function Cart({ isOpen, onClose }: CartProps) {
+  const {
+    items,
+    totalAmount,
+    totalActualAmount,
+    removeFromCart,
+    updateQuantity,
+    clearCart,
+    delivery,
+    setDelivery,
+    setDeliveryField,
+    clearDelivery,
+
+    editingQuotationId,
+    clearQuotationMode,
+    copiedFromOrder,
+    cancelOrderCopy,
+  } = useCartStore();
+
+  const { saveQuotation, deleteQuotation } = useQuotations();
+  const { activeSeason } = useSeasons();
+  const [isQuotationSaving, setIsQuotationSaving] = useState(false);
+
+  const [showPayment, setShowPayment] = useState(false);
+  const [showDeliveryForm, setShowDeliveryForm] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const { userProfile, signInWithPhone, verifyOTP } = useAuth();
+  const cartAddressRef = useRef<HTMLDivElement>(null);
+  const [showPhoneVerification, setShowPhoneVerification] = useState(false);
+  const [verifyingPhone, setVerifyingPhone] = useState("");
+  const [verificationId, setVerificationId] = useState("");
+  const [otp, setOtp] = useState("");
+  const [otpError, setOtpError] = useState("");
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [lastOrderId, setLastOrderId] = useState<string | null>(null);
+  const { user, userRole } = useAuth();
+  const navigate = useNavigate();
+  const [statesList, setStatesList] = useState<{ id: number; name: string }[]>(
+    [],
+  );
+  const [districtsList, setDistrictsList] = useState<
+    { id: number; name: string }[]
+  >([]);
+  const [orderError, setOrderError] = useState<string | null>(null);
+  const [orderSuccess, setOrderSuccess] = useState(false); // <-- New state
+  const [upiCopied, setUpiCopied] = useState(false);
+  // Shown to a signed-out customer at checkout: sign in, create an account,
+  // or skip both. Skipping is a first-class option, not a fallback.
+  const [showAuthGate, setShowAuthGate] = useState(false);
+  // Set once a guest chooses to carry on without an account, so the gate does
+  // not reappear if they step back to edit the cart.
+  const [continuingAsGuest, setContinuingAsGuest] = useState(false);
+  // The reference a guest needs to track the order afterwards.
+  const [guestOrderRef, setGuestOrderRef] = useState<{
+    short_id: string;
+    phone: string;
+  } | null>(null);
+  const { settings: appSettings } = useAppSettings();
+  // Contact lines come from Admin Settings, never from constants here, so the
+  // shop can change a number without a deploy. A blank field hides its line.
+  const shopPhone = appSettings?.business_phone?.trim() || "";
+  const shopEmail = appSettings?.business_email?.trim() || "";
+  const shopWhatsapp = whatsappNumber(shopPhone);
+  // The summary of the order just placed. The cart is cleared on success, so
+  // this is the only copy left to download again from the success screen.
+  const [orderSummary, setOrderSummary] = useState<BusinessDocument | null>(
+    null,
+  );
+  const [isDownloadingSummary, setIsDownloadingSummary] = useState(false);
+  // The quotation being sent on WhatsApp from the cart. It is always a quote
+  // that has just been written to the database -- see handleShareQuotation.
+  const [shareRequest, setShareRequest] = useState<WhatsAppShareRequest | null>(
+    null,
+  );
+
+  // ensure when cart empties we clear delivery (optional)
+  useEffect(() => {
+    if ((items || []).length === 0) {
+      clearDelivery();
+    }
+  }, [items, clearDelivery]);
+
+  /**
+   * Staff key in orders for customers. For them the phone comes first and
+   * looks up who has bought before, and the form is not prefilled with their
+   * own profile -- that only put the admin's own number in the box the
+   * lookup reads.
+   */
+  const isStaff = ["admin", "superadmin"].includes(userRole?.name || "");
+
+  const fillFromCustomer = async (customer: CustomerMatch) => {
+    // The State picker only shows a value that is exactly one of its options,
+    // and an old order may have it typed in another case.
+    const canonicalState =
+      statesList.find((s) => s.name.toLowerCase() === customer.state.trim().toLowerCase())?.name ||
+      customer.state;
+    setDelivery({
+      phone: customer.phone,
+      customerName: customer.name,
+      email: customer.email,
+      address: customer.address,
+      city: customer.city,
+      state: canonicalState,
+      district: customer.district,
+      pincode: customer.pincode,
+    });
+    setCustomerSearch("");
+    const extras = await customerOrderExtras(customer.phone);
+    if (extras.alternatePhone) setDeliveryField("alternatePhone", extras.alternatePhone);
+    // The summary's district is the latest order's, which may be blank.
+    if (!customer.district.trim() && extras.district) {
+      setDeliveryField("district", extras.district);
+    }
+    toast.success(`Filled in ${customer.name || "the customer"}'s details`);
+  };
+
+  /** The free search box above the form: name, place, pincode or number. */
+  const [customerSearch, setCustomerSearch] = useState("");
+
+  /**
+   * The same for the state. The District list is looked up by the state's
+   * exact name, so a state carried in from an old order or a quotation as
+   * "tamil nadu" or "Tamil Nadu " left the State picker blank, no districts
+   * loaded, and the order's district -- filled in correctly -- had nothing
+   * to show against. Set directly, not through the picker's change handler,
+   * because that one clears the district.
+   */
+  useEffect(() => {
+    const current = delivery.state.trim().toLowerCase();
+    if (!current || statesList.length === 0) return;
+    const canonical = statesList.find((s) => s.name.trim().toLowerCase() === current);
+    if (canonical && canonical.name !== delivery.state) {
+      setDeliveryField("state", canonical.name);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statesList, delivery.state]);
+
+  /**
+   * The District picker only shows a value that is exactly one of its
+   * options, and the list for a state arrives after the state is set. A
+   * district filled in from an old order may be typed in another case or
+   * with stray spaces, which left the picker blank -- so once the list is in,
+   * the filled-in value is swapped for the list's own spelling.
+   */
+  useEffect(() => {
+    const current = delivery.district.trim().toLowerCase();
+    if (!current || districtsList.length === 0) return;
+    const canonical = districtsList.find((d) => d.name.trim().toLowerCase() === current);
+    if (canonical && canonical.name !== delivery.district) {
+      setDeliveryField("district", canonical.name);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [districtsList, delivery.district]);
+
+  // Prefill delivery from profile on mount if empty
+  useEffect(() => {
+    if (isStaff) return;
+    if (delivery.customerName === "" && userProfile) {
+      setDelivery({
+        customerName: userProfile.full_name || "",
+        email: userProfile.email || "",
+        phone: userProfile.phone || "",
+        address: userProfile.address || "",
+        city: userProfile.city || "",
+        state: userProfile.state || "",
+        district: (userProfile as any).district || "",
+        pincode: userProfile.pincode || "",
+        country: userProfile.country || "India",
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userProfile, isStaff]);
+
+  // Add this utility function to clear recaptcha (if you use a ref, adjust accordingly)
+  function clearRecaptcha() {
+    const recaptcha = document.getElementById("recaptcha-container");
+    if (recaptcha) recaptcha.innerHTML = "";
+  }
+
+  // Update delivery fields from inputs or react-select; uses store updater setDeliveryField
+  function handleDeliveryDetailsChange(e: any) {
+    const name = e?.target?.name;
+    const value = e?.target?.value;
+    if (!name) return;
+
+    // If state changed, clear district selection and cached district list
+    if (name === "state") {
+      setDeliveryField("state", value);
+      setDeliveryField("district", "");
+      setDistrictsList([]);
+      return;
+    }
+
+    setDeliveryField(name, value);
+  }
+
+  useEffect(() => {
+    if (showPhoneVerification && verifyingPhone) {
+      (async () => {
+        const { verificationId: vId, error } =
+          await signInWithPhone(verifyingPhone);
+        if (!error && vId) {
+          setVerificationId(vId);
+        } else {
+          setShowPhoneVerification(false);
+          setVerificationId("");
+          clearRecaptcha(); // <-- Clear recaptcha on error
+          toast.success(
+            "Order placed successfully! We will contact you shortly through phone or whatsapp for further details.",
+            { duration: 10000 },
+          );
+          clearCart();
+          onClose();
+          celebrationConfetti();
+        }
+      })();
+    }
+  }, [showPhoneVerification, verifyingPhone]);
+
+  /**
+   * Writes the quotation and gives back its id and number, or null if it
+   * could not go out (empty cart, no customer). Both the Save and the Share
+   * button come through here: a shared quotation is a numbered document, so
+   * there has to be a saved row behind that number.
+   */
+  const persistQuotation = async (): Promise<
+    { id: string; short_id: string } | null
+  > => {
+    if ((items || []).length === 0) {
+      toast.error("Cart is empty");
+      return null;
+    }
+
+    // The same cleaning as an order, with only name and phone required.
+    const clean = cleanDelivery(delivery);
+    setDelivery(clean);
+    const problem = deliveryProblem(clean, "quotation");
+    if (problem) {
+      toast.error(problem);
+      return null;
+    }
+
+    setIsQuotationSaving(true);
+    try {
+      const quotationData = {
+        customer_name: clean.customerName,
+        email: clean.email,
+        phone: clean.phone,
+        address: clean.address,
+        city: clean.city,
+        state: clean.state,
+        pincode: clean.pincode,
+        total_amount: totalAmount,
+      };
+
+      // As on an order, a quoted line is a product or a family pack. Sending
+      // a pack id as a product_id would be rejected by the foreign key.
+      const quotationItems = items.map((item) => ({
+        product_id: item.is_pack ? null : item.id,
+        combo_pack_id: item.is_pack ? item.id : null,
+        quantity: item.quantity,
+        price: item.offer_price,
+        total_price: item.totalPrice,
+      }));
+
+      return await saveQuotation(
+        quotationData,
+        quotationItems,
+        editingQuotationId || undefined,
+      );
+    } catch (error) {
+      console.error(error);
+      return null;
+    } finally {
+      setIsQuotationSaving(false);
+    }
+  };
+
+  const handleSaveQuotation = async () => {
+    const saved = await persistQuotation();
+    if (!saved) return;
+
+    clearCart();
+    // clearQuotationMode is handled by clearCart if implemented, but let's be safe or if clearCart logic changes
+    // In store I added editingQuotationId: null to clearCart, so it's fine.
+    onClose();
+  };
+
+  /** The quotation exactly as the cart stands, ready to be drawn. */
+  const quotationDocument = (
+    number: string,
+    customer: DeliveryDetailsState,
+  ): BusinessDocument => ({
+    kind: "quotation",
+    number,
+    date: new Date(),
+    customer: {
+      name: customer.customerName,
+      phone: customer.phone,
+      email: customer.email,
+      address: customer.address,
+      city: customer.city,
+      district: customer.district,
+      state: customer.state,
+      pincode: customer.pincode,
+    },
+    // No product code: this sheet goes to the customer, and our codes mean
+    // nothing to them.
+    lines: items.map((item) => ({
+      name: item.name,
+      quantity: item.quantity,
+      price: item.offer_price,
+      total: item.totalPrice,
+    })),
+    subtotal: totalAmount,
+    business: businessFromSettings(appSettings),
+  });
+
+  /**
+   * Saves the quotation and sends it to the customer on WhatsApp.
+   *
+   * The document is built here, before the dialog opens, because the cart is
+   * cleared the moment the dialog closes -- by then there is nothing left to
+   * draw from.
+   */
+  const handleShareQuotation = async () => {
+    const saved = await persistQuotation();
+    if (!saved) return;
+
+    const number = saved.short_id || saved.id.slice(0, 8);
+    const business = businessFromSettings(appSettings);
+    // `delivery` here is still the render's copy, from before the save put
+    // the trimmed values in the store; clean it the same way so the shared
+    // PDF matches the saved row.
+    const customer = cleanDelivery(delivery);
+    const document = quotationDocument(number, customer);
+
+    setShareRequest({
+      kind: "quotation",
+      title: `Quotation ${number}`,
+      customerName: customer.customerName,
+      phone: customer.phone,
+      fileName: documentFileName("quotation", number),
+      message:
+        `Hello ${customer.customerName || ""}, here is your quotation ${number} ` +
+        `from ${business.name}. Total Rs. ${Number(totalAmount || 0).toFixed(2)}.`,
+      makePdf: async () => {
+        const pdf = await buildDocumentPdf(document);
+        return pdf.output("blob");
+      },
+    });
+  };
+
+  /**
+   * Closing the share dialog finishes the job: the quote is saved, so the
+   * cart empties and closes just as it does after Save Quote. Leaving the
+   * same lines in the cart would let the next Share write a second quotation
+   * for the same order.
+   */
+  const handleShareDialogClose = () => {
+    setShareRequest(null);
+    clearCart();
+    onClose();
+  };
+
+  /**
+   * Copies the UPI id.
+   *
+   * clipboard.writeText needs a secure context and permission, neither of
+   * which is guaranteed on a customer's phone, so a failure falls back to
+   * telling them to select it by hand rather than silently doing nothing.
+   */
+  const handleCopyUpiId = async () => {
+    try {
+      await navigator.clipboard.writeText(UPI_ID);
+      setUpiCopied(true);
+      toast.success("UPI ID copied");
+      setTimeout(() => setUpiCopied(false), 2500);
+    } catch {
+      toast.error("Could not copy — please select the UPI ID and copy it");
+    }
+  };
+
+  /**
+   * Saves the order summary PDF to the device. Called straight after the
+   * order is placed and again from the success screen's button, for browsers
+   * that block a download nobody clicked for.
+   */
+  const downloadOrderSummary = async (summary: BusinessDocument) => {
+    setIsDownloadingSummary(true);
+    try {
+      const pdf = await buildDocumentPdf(summary);
+      pdf.save(documentFileName("order", summary.number));
+    } catch (err) {
+      console.error("Order summary PDF failed", err);
+      toast.error("Could not download the order summary");
+    } finally {
+      setIsDownloadingSummary(false);
+    }
+  };
+
+  /** Opens the delivery form and brings it into view. */
+  const goToDeliveryForm = () => {
+    setShowDeliveryForm(true);
+    setTimeout(() => {
+      cartAddressRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    }, 100);
+  };
+
+  const handlePlaceOrder = async (paymentMethod: string) => {
+    // Reverted to original signature to maintain syntactical correctness
+    try {
+      setIsProcessing(true);
+      setOrderError(null);
+
+      // Checked and saved trimmed; see lib/deliveryDetails. The cleaned
+      // values go back into the form too, so what is on screen is exactly
+      // what was saved.
+      const clean = cleanDelivery(delivery);
+      setDelivery(clean);
+      const {
+        customerName,
+        phone,
+        address,
+        city,
+        state,
+        district,
+        pincode,
+        email,
+      } = clean;
+      const problem = deliveryProblem(clean, "order");
+      if (problem) {
+        throw new Error(problem);
+      }
+      if (items.length === 0) {
+        throw new Error("Your cart is empty");
+      }
+
+      // An account is optional. If there is a session the order is attached to
+      // it exactly as before; if there is not, it goes through the guest
+      // endpoint, which prices it from the catalog server-side.
+      const {
+        data: { user: currentUser },
+      } = await supabase.auth.getUser();
+
+      // check minimum order amount
+      const isAdmin = ["admin", "superadmin"].includes(userRole?.name || "");
+
+      if (!isAdmin) {
+        if (totalAmount < 3000) {
+          throw new Error("Minimum order amount is ₹3000");
+        }
+      }
+
+      // --- PARALLEL STOCK CHECKS ---
+      // Fire all stock queries in parallel
+      // const stockResults = await Promise.all(
+      //   items.map((item) =>
+      //     supabase.from("products").select("stock").eq("id", item.id).single()
+      //   )
+      // );
+
+      // Check for out-of-stock items
+      // for (let i = 0; i < items.length; i++) {
+      //   const stock = stockResults[i].data?.stock ?? 0;
+      //   if (items[i].quantity > stock) {
+      //     throw new Error(
+      //       `Insufficient stock for ${items[i].name}. Only ${stock} left.`
+      //     );
+      //   }
+      // }
+
+      // Create order. A pack line carries the pack rather than a product —
+      // the database expands it into its contents when it moves the stock.
+      const orderItems = items.map((item) => ({
+        product_id: item.is_pack ? null : item.id,
+        combo_pack_id: item.is_pack ? item.id : null,
+        quantity: item.quantity,
+        price: item.offer_price,
+        total_price: item.totalPrice,
+      }));
+
+      // Create order and get the order data (with id)
+      let orderData: { id: string; short_id?: string | null };
+
+      if (currentUser) {
+        orderData = await createOrder({
+          total_amount: totalAmount,
+          payment_method: paymentMethod,
+          items: orderItems,
+          delivery_details: clean,
+          season_id: activeSeason?.id ?? null,
+        });
+        setGuestOrderRef(null);
+      } else {
+        const guestOrder = await createGuestOrder({
+          delivery: clean,
+          items: items.map((item) => ({
+            product_id: item.is_pack ? null : item.id,
+            combo_pack_id: item.is_pack ? item.id : null,
+            quantity: item.quantity,
+          })),
+          paymentMethod,
+        });
+        orderData = { id: guestOrder.id, short_id: guestOrder.short_id };
+        // A guest has no My Orders to come back to, so the order number is
+        // put in front of them and kept on the device.
+        setGuestOrderRef({
+          short_id: guestOrder.short_id,
+          phone: clean.phone,
+        });
+      }
+
+      setLastOrderId(orderData.id);
+
+      // Taken from the cart before it is cleared below: this is exactly what
+      // the customer saw and confirmed.
+      const summary: BusinessDocument = {
+        kind: "order",
+        number: orderData.short_id || orderData.id.slice(0, 8),
+        date: new Date(),
+        customer: {
+          name: customerName,
+          phone,
+          email,
+          address,
+          city,
+          district,
+          state,
+          pincode,
+        },
+        lines: items.map((item) => ({
+          code: (item as any).product_code ?? null,
+          name: item.name,
+          quantity: item.quantity,
+          price: item.offer_price,
+          total: item.totalPrice,
+        })),
+        subtotal: totalAmount,
+        paymentMethod,
+        business: businessFromSettings(appSettings),
+      };
+      setOrderSummary(summary);
+      // Not awaited: the order is placed whatever happens to the PDF.
+      void downloadOrderSummary(summary);
+
+      // setVerifyingPhone(deliveryDetails.phone);
+      // setShowPhoneVerification(true);
+
+      setShowPayment(true);
+      setShowDeliveryForm(false);
+      setShowPhoneVerification(false);
+      setVerificationId("");
+      clearRecaptcha(); // <-- Clear recaptcha on error
+      toast.success(
+        "Order placed successfully! We will contact you shortly through phone or whatsapp for further details.",
+        { duration: 10000 },
+      );
+      clearCart();
+      setOrderSuccess(true);
+
+      // If we are converting a quotation, delete the original quotation
+      if (editingQuotationId) {
+        await deleteQuotation(editingQuotationId);
+        clearQuotationMode();
+      }
+
+      // clear cart
+      clearCart();
+      //onClose();
+      celebrationConfetti();
+    } catch (error) {
+      const msg =
+        error instanceof Error ? error.message : "Failed to place order";
+      setOrderError(msg); // Set error for display below form
+      toast.error(msg);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleEstimateReport = async () => {
+    // Build HTML similar to order summary but for current cart + delivery details
+    const now = new Date();
+    // try to get product ordering from products table (if exists) and sort accordingly
+    let sortedItems = items.slice();
+    try {
+      const ids = items.map((it) => it.id).filter(Boolean);
+      if (ids.length > 0) {
+        const { data: prods } = await supabase
+          .from("season_catalog")
+          .select('id, "order"')
+          .eq("season_id", activeSeason?.id ?? "")
+          .in("id", ids);
+        const orderMap: Record<string, number> = {};
+        (prods || []).forEach((p: any) => {
+          orderMap[p.id] = Number(p.order ?? 0);
+        });
+        sortedItems = items.slice().sort((a, b) => {
+          return (orderMap[a.id] ?? 0) - (orderMap[b.id] ?? 0);
+        });
+      }
+    } catch (err) {
+      console.warn("Failed to fetch product order for estimate:", err);
+    }
+
+    const itemsRows = sortedItems
+      .map(
+        (item, idx) => `
+          <tr>
+            <td>${idx + 1}</td>
+            <td>${item.name}</td>
+            <td style="text-align:center;">${item.quantity}</td>
+            <td style="text-align:right;">₹${Number(
+              item.offer_price ?? 0,
+            ).toFixed(2)}</td>
+            <td style="text-align:right;">₹${Number(
+              item.totalPrice ?? item.quantity * Number(item.offer_price ?? 0),
+            ).toFixed(2)}</td>
+          </tr>`,
+      )
+      .join("");
+
+    const html = `<!doctype html>
+      <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>Estimate Report</title>
+        <style>
+          body { font-family: Arial, sans-serif; color:#222; margin:20px; }
+          h1 { color:#003620; }
+          table { width:100%; border-collapse:collapse; margin-top:12px; }
+          th, td { border:1px solid #e6e6e6; padding:8px; }
+          th { background:#f7f7f7; text-align:left; }
+          .right { text-align:right; }
+          .center { text-align:center; }
+          .summary { margin-top:16px; width:100%; }
+          .small { font-size:0.9rem; color:#666; }
+        </style>
+      </head>
+      <body>
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+      <div>  
+      <h1>Estimation</h1>
+        <div class="small">Date: ${now.toLocaleString()}</div>
+        <h3>Customer Details</h3>
+        <div class="small">
+          <div><strong>Name:</strong> ${delivery.customerName || "-"}</div>
+          <div><strong>Phone:</strong> ${delivery.phone || "-"}</div>
+          <div><strong>Email:</strong> ${delivery.email || "-"}</div>
+          <div><strong>Address:</strong> ${delivery.address || "-"}, ${
+            delivery.city || ""
+          } ${delivery.pincode || ""}</div>
+        </div>
+        </div>
+        <div style=""><img style="height:100px" src="${BRAND.logo}" alt="${BRAND.name}"/></div>
+     </div>
+        <h3 style="margin-top:14px;">Product Details</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>S.No</th>
+              <th>Product</th>
+              <th class="center">Qty</th>
+              <th class="right">Price</th>
+              <th class="right">Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${itemsRows}
+            <tr>
+              <td colspan="4" class="right"><strong>Grand Total</strong></td>
+              <td class="right"><strong>₹${totalAmount.toFixed(2)}</strong></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="summary small">
+          <p>Note: This is an estimate. Final prices may vary.</p>
+        </div>
+      </body>
+      </html>`;
+
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) {
+      toast.error("Unable to open print window");
+      return;
+    }
+
+    printWindow.document.open();
+    printWindow.document.write(html);
+    printWindow.document.close();
+    addPrintToolbar(printWindow);
+
+    const cleanup = () => {
+      try {
+        if (!printWindow.closed) printWindow.close();
+      } catch (e) {
+        /* ignore */
+      }
+    };
+
+    try {
+      printWindow.onafterprint = cleanup;
+      printWindow.addEventListener?.("beforeunload", cleanup);
+      printWindow.addEventListener?.("afterprint", cleanup);
+    } catch (e) {
+      /* ignore */
+    }
+
+    const doPrint = () => {
+      try {
+        printWindow.focus();
+        printWindow.print();
+      } catch (e) {
+        console.error("Print failed:", e);
+        cleanup();
+      }
+    };
+
+    if (printWindow.document.readyState === "complete") {
+      doPrint();
+    } else {
+      printWindow.onload = doPrint;
+      setTimeout(doPrint, 800);
+    }
+
+    // Safety close if afterprint doesn't fire
+    setTimeout(cleanup, 20000);
+  };
+
+  // Confetti bursts from both sides to mark an order placed.
+  function celebrationConfetti() {
+    const duration = 10 * 1000; // 3 seconds (adjust as needed)
+    const animationEnd = Date.now() + duration;
+    const defaults = {
+      startVelocity: 30,
+      spread: 360,
+      ticks: 60,
+      zIndex: 9999,
+    };
+
+    function randomInRange(min: number, max: number) {
+      return Math.random() * (max - min) + min;
+    }
+
+    const interval = setInterval(function () {
+      const timeLeft = animationEnd - Date.now();
+
+      if (timeLeft <= 0) {
+        clearInterval(interval);
+        return;
+      }
+
+      const particleCount = 50 * (timeLeft / duration);
+      // since particles fall down, start a bit higher than random
+      confetti({
+        ...defaults,
+        particleCount,
+        origin: { x: randomInRange(0.1, 0.3), y: Math.random() - 0.2 },
+      });
+      confetti({
+        ...defaults,
+        particleCount,
+        origin: { x: randomInRange(0.7, 0.9), y: Math.random() - 0.2 },
+      });
+    }, 250);
+  }
+
+  // Fetch active states on mount
+  useEffect(() => {
+    (async () => {
+      const { data, error } = await supabase
+        .from("states")
+        .select("id, name")
+        .eq("is_active", true)
+        .order("name");
+      if (!error && data) setStatesList(data);
+    })();
+  }, []);
+
+  // Fetch districts when state changes
+  useEffect(() => {
+    if (!delivery.state) {
+      setDistrictsList([]);
+      return;
+    }
+    (async () => {
+      // Find state id by name
+      const selectedState = statesList.find((s) => s.name === delivery.state);
+      if (!selectedState) return;
+      const { data, error } = await supabase
+        .from("districts")
+        .select("id, name")
+        .eq("state_id", selectedState.id)
+        .eq("is_active", true)
+        .order("name");
+      if (!error && data) setDistrictsList(data);
+    })();
+  }, [delivery.state, statesList]);
+
+  if (!isOpen) return null;
+
+  // Convert states and districts to select options
+  const stateOptions = statesList.map((state) => ({
+    value: state.name,
+    label: state.name,
+  }));
+  const districtOptions = districtsList.map((district) => ({
+    value: district.name,
+    label: district.name,
+  }));
+
+  // helper to clear cart with confirmation
+  const handleClearCart = () => {
+    if (!items || items.length === 0) {
+      if (typeof window !== "undefined") window.alert("Cart is already empty.");
+      return;
+    }
+    const ok = window.confirm(
+      "Clear cart — This will permanently remove all items from your cart. Do you want to continue?",
+    );
+    if (!ok) return;
+    clearCart();
+    // optionally clear delivery as well
+    clearDelivery();
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 bg-black/50 z-60 flex justify-end"
+    >
+      <WhatsAppShareDialog
+        request={shareRequest}
+        onClose={handleShareDialogClose}
+      />
+      {isProcessing && (
+        <div className="fixed inset-0 z-[100] flex flex-col items-center justify-center bg-black/60">
+          <Loader2 className="w-12 h-12 animate-spin text-primary-orange mb-4" />
+          <span className="text-lg font-semibold text-white">
+            Processing your order...
+          </span>
+        </div>
+      )}
+      <div className="h-full w-full max-w-4xl bg-background overflow-y-auto flex flex-col relative">
+        {/* Header */}
+        <div className="sticky top-0 bg-background z-10 p-4 md:p-6 border-b border-card-border/10">
+          <div className="flex items-center justify-between">
+            <h2 className="font-heading text-xl md:text-2xl">Shopping Cart</h2>
+            <button
+              onClick={onClose}
+              className="p-2 hover:bg-card/50 rounded-full transition-colors"
+            >
+              <X className="w-6 h-6" />
+            </button>
+          </div>
+        </div>
+
+        {/* A copied order is waiting to be placed. Saying so, with a way out,
+            matters because the copy replaced whatever was in the cart: Cancel
+            puts that back. Placing the order or clearing the cart ends it too. */}
+        {copiedFromOrder && !orderSuccess && (
+          <div className="mx-4 md:mx-6 mt-3 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-primary-orange/40 bg-primary-orange/10 px-4 py-3">
+            <div className="text-sm">
+              <span className="font-semibold">
+                Copy of order {copiedFromOrder.label}
+              </span>
+              <span className="text-text/70">
+                {" "}
+                — change the items or shipping details, then place it as a new
+                order.
+              </span>
+            </div>
+            <button
+              onClick={() => {
+                const restoring = copiedFromOrder.previous.items.length;
+                const ok = window.confirm(
+                  `Cancel the copy of order ${copiedFromOrder.label}? Nothing is placed.` +
+                    (restoring
+                      ? ` Your earlier cart (${restoring} item${restoring === 1 ? "" : "s"}) comes back.`
+                      : ""),
+                );
+                if (!ok) return;
+                cancelOrderCopy();
+                toast.success("Copy cancelled");
+              }}
+              className="px-3 py-1.5 rounded-md border border-red-600 text-red-600 hover:bg-red-50 text-sm font-medium whitespace-nowrap"
+            >
+              Cancel copy
+            </button>
+          </div>
+        )}
+
+        <div className="container mx-auto px-4 py-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            {/* Informational message about payment */}
+            <div className="text-sm ml-2 text-center px-3 text-text/60 ">
+              Submit your order now — our team will contact you within 24 hours
+              to confirm stock and payment.
+              {shopPhone && <> For urgent help call {shopPhone}.</>}
+            </div>
+            {/* Clear Cart button (top) - only show when cart has items */}
+            {items && items.length > 0 && (
+              <button
+                onClick={handleClearCart}
+                className="bg-red-600 text-white px-3 py-1 rounded-md hover:bg-red-700 text-sm"
+                title="Clear cart"
+              >
+                Clear Cart
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Body */}
+        <div className="p-4 md:p-6 flex-grow">
+          {orderSuccess ? (
+            <div className="flex flex-col items-center justify-center min-h-[300px] gap-6">
+              <div className="bg-green-50 border border-green-200 rounded-xl p-6 w-full text-center shadow">
+                <h2 className="text-2xl font-bold text-green-700 mb-2">
+                  🎉 Enquiry Submitted Successfully!
+                </h2>
+                {/* A guest has no My Orders page to return to, so the
+                    reference they will need is shown here and kept on the
+                    device for the Track Order page to prefill. */}
+                {guestOrderRef && (
+                  <div className="mb-4 rounded-lg border border-green-300 bg-white/70 px-4 py-3 text-green-900">
+                    <p className="text-sm">Your order number</p>
+                    <p className="text-2xl font-bold font-mono tracking-wide">
+                      {guestOrderRef.short_id}
+                    </p>
+                    <p className="text-xs mt-2">
+                      Keep this safe. Track your order any time with this number
+                      and{" "}
+                      <span className="font-semibold">
+                        {guestOrderRef.phone}
+                      </span>
+                      .
+                    </p>
+                    <a
+                      href="/track-order"
+                      className="inline-block mt-3 text-sm font-semibold underline"
+                    >
+                      Track this order
+                    </a>
+                  </div>
+                )}
+                {orderSummary && (
+                  <div className="mb-4">
+                    <button
+                      type="button"
+                      onClick={() => downloadOrderSummary(orderSummary)}
+                      disabled={isDownloadingSummary}
+                      className="inline-flex items-center gap-2 px-5 py-2 border-2 border-green-600 text-green-700 rounded-lg font-semibold hover:bg-green-100 transition disabled:opacity-60"
+                    >
+                      {isDownloadingSummary ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Download className="w-4 h-4" />
+                      )}
+                      Download Order Summary (PDF)
+                    </button>
+                  </div>
+                )}
+                <p className="text-base text-green-800 mb-4">
+                  Thank you for your order. Our team will contact you soon
+                  regarding order and payment confirmation.
+                  <br />
+                  <br />
+                  Meanwhile, you can use any of our payment options below to
+                  complete your payment and send us the screenshot with your
+                  contact details, or you can contact us directly.
+                </p>
+                <div className="mb-4">
+                  <a
+                    href="/payment"
+                    className="inline-block px-6 py-2 bg-primary-orange text-white rounded-lg font-semibold hover:bg-primary-orange/90 transition"
+                  >
+                    Go to Payment Option Page
+                  </a>
+                </div>
+                {(shopPhone || shopEmail) && (
+                  <div className="text-sm text-gray-700">
+                    <div className="font-semibold mb-1">Contact Us:</div>
+                    {shopPhone && (
+                      <div className="flex flex-row space-x-3 justify-center align-items-center mb-1">
+                        📞{"  "}
+                        <a
+                          href={`tel:${shopPhone.replace(/[^\d+]/g, "")}`}
+                          className="underline"
+                        >
+                          {shopPhone}
+                        </a>
+                      </div>
+                    )}
+                    {shopWhatsapp && (
+                      <div>
+                        📱{" "}
+                        <a
+                          href={`https://wa.me/${shopWhatsapp}`}
+                          className="underline"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          WhatsApp
+                        </a>
+                      </div>
+                    )}
+                    {shopEmail && (
+                      <div>
+                        ✉️{" "}
+                        <a href={`mailto:${shopEmail}`} className="underline">
+                          {shopEmail}
+                        </a>
+                      </div>
+                    )}
+                  </div>
+                )}
+                {
+                  // referral message like share it with your friends and family
+                  //and earn 5% ref commission on their first order, provide shareable link and make that sharable like available on whatsapp and facebook
+                  <div className="text-sm text-gray-700 mt-4 text-primary-orange font-semibold">
+                    Refer our website to your friends and family and earn{" "}
+                    <p className="font-bold">5%</p> referral commission on their
+                    first order! Share the link:{" "}
+                    <a
+                      href={`https://www.${BRAND.domain}`}
+                      className="underline"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      www.{BRAND.domain}
+                    </a>
+                  </div>
+                }
+              </div>
+              {/* Payment, on the screen where it is actually acted on.
+                  Two ways to pay, both large: someone reading this has their
+                  phone in hand and is about to scan or paste. Bank transfer
+                  used to sit alongside and pulled attention away from the two
+                  that complete in seconds. */}
+              <div className="w-full">
+                <div className="bg-card/30 rounded-xl p-4 md:p-8 w-full border-2 border-primary-orange/30">
+                  <div className="text-center mb-6">
+                    <h3 className="font-montserrat font-bold text-2xl md:text-3xl mb-1">
+                      Pay Now
+                    </h3>
+                    <p className="text-text/70">
+                      Scan the code or pay to our UPI ID, then send us the
+                      screenshot with your order number.
+                    </p>
+                  </div>
+
+                  {/* The QR gets the wider column: it is the one people
+                      scan, and a small code fails on older phone cameras. */}
+                  {!UPI_ID && (
+                    <div className="bg-card border border-primary-yellow/50 rounded-xl p-6 text-center text-text/80">
+                      We share our payment details when we confirm your order by phone or WhatsApp.
+                    </div>
+                  )}
+                  <div className={`${UPI_ID ? "grid" : "hidden"} grid-cols-1 gap-6 ${PAYMENT_QR ? "lg:grid-cols-[3fr_2fr]" : ""}`}>
+                    {/* QR */}
+                    <div className={`bg-card p-4 md:p-6 rounded-xl ${PAYMENT_QR ? "flex" : "hidden"} flex-col items-center`}>
+                      <div className="flex items-center gap-3 mb-4">
+                        <QrCode className="w-7 h-7 text-primary-orange" />
+                        <h4 className="font-montserrat font-bold text-xl">
+                          Scan &amp; Pay
+                        </h4>
+                      </div>
+                      {/* The image is a portrait payment card, not a bare
+                          square code. Forced into a square it shrank to
+                          about 70% of the box; at its own shape it fills
+                          the width. */}
+                      <div className="bg-white p-2 rounded-lg w-full max-w-sm">
+                        <img
+                          src={PAYMENT_QR ?? ""}
+                          alt={`UPI QR code for ${BRAND.name}`}
+                          width={665}
+                          height={942}
+                          className="w-full h-auto rounded"
+                        />
+                      </div>
+                      <p className="text-sm text-text/60 text-center mt-4">
+                        Works with GPay, PhonePe, Paytm and any UPI app
+                      </p>
+                    </div>
+
+                    {/* UPI ID */}
+                    <div className="bg-card p-4 md:p-6 rounded-xl flex flex-col items-center justify-center">
+                      <div className="flex items-center gap-3 mb-4">
+                        <Wallet className="w-7 h-7 text-primary-orange" />
+                        <h4 className="font-montserrat font-bold text-xl">
+                          UPI ID
+                        </h4>
+                      </div>
+                      {/* Sized to sit on one line in this column. If it
+                          ever must wrap, it breaks before the @ (the <wbr>)
+                          rather than mid-handle, which is what break-all
+                          did: "…@oksb" / "i". */}
+                      <div className="bg-background w-full rounded-lg px-3 py-4 text-center">
+                        <p className="font-mono text-base sm:text-lg lg:text-base font-bold break-words select-all">
+                          {UPI_ID.split("@")[0]}
+                          <wbr />
+                          {UPI_ID.includes("@") && `@${UPI_ID.split("@").slice(1).join("@")}`}
+                        </p>
+                      </div>
+                      {/* Reading a UPI id off a screen and typing it into
+                          another app is where payments go wrong. */}
+                      <button
+                        type="button"
+                        onClick={handleCopyUpiId}
+                        className="mt-4 w-full flex items-center justify-center gap-2 px-4 py-3 rounded-lg bg-primary-orange text-white font-semibold hover:bg-primary-orange/90 transition-colors"
+                      >
+                        {upiCopied ? (
+                          <>
+                            <Check className="w-5 h-5" />
+                            <span>Copied</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-5 h-5" />
+                            <span>Copy UPI ID</span>
+                          </>
+                        )}
+                      </button>
+                      <p className="text-sm text-text/60 text-center mt-4">
+                        Paste this in your UPI app to pay
+                      </p>
+                    </div>
+                  </div>
+
+                  {shopWhatsapp && (
+                    <p className="text-center text-sm text-text/70 mt-6">
+                      Paid already? Send the screenshot on{" "}
+                      <a
+                        href={`https://wa.me/${shopWhatsapp}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-primary-orange font-semibold underline"
+                      >
+                        WhatsApp
+                      </a>{" "}
+                      and we will confirm your order.
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
+          ) : items.length === 0 ? (
+            <p className="text-center text-text/60">Your cart is empty</p>
+          ) : (
+            <div className="flex flex-col gap-6">
+              {/* Cart Table */}
+              <div className="bg-card/30 rounded-xl overflow-x-auto shadow-lg">
+                {/* Desktop/Table View */}
+                <table className="min-w-full text-sm hidden sm:table">
+                  <thead>
+                    <tr className="bg-card/50">
+                      <th className="py-4 px-2 sm:px-4 text-left whitespace-nowrap">
+                        Product
+                      </th>
+                      <th className="py-4 px-2 sm:px-4 text-center whitespace-nowrap">
+                        Quantity
+                      </th>
+                      <th className="py-4 px-2 sm:px-4 text-right whitespace-nowrap">
+                        Price
+                      </th>
+                      <th className="py-4 px-2 sm:px-4 text-right whitespace-nowrap">
+                        Total
+                      </th>
+                      <th className="py-4 px-2 sm:px-4 whitespace-nowrap"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {items.map((item) => (
+                      <tr
+                        key={item.id}
+                        className="border-t border-card-border/10"
+                      >
+                        <td className="py-4 px-2 sm:px-4 max-w-xs">
+                          <div className="flex items-center gap-2 sm:gap-4 max-w-full">
+                            <img
+                              src={
+                                item.image
+                                  ? Array.isArray(item.image)
+                                    ? item.image[0]
+                                    : item.image?.split(",")[0]
+                                  : item.image_url
+                                    ? productImageUrl(item.image_url.split(",")[0])
+                                    : "/assets/img/logo/logo-product.png"
+                              }
+                              alt={item.name}
+                              className="w-12 h-12 sm:w-16 sm:h-16 object-cover rounded-lg"
+                            />
+                            <div className="min-w-0">
+                              <h3 className="font-montserrat font-bold truncate">
+                                {item.name}
+                              </h3>
+                              <p className="text-xs sm:text-sm text-text/60 truncate">
+                                {item.content}
+                              </p>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="py-4 px-2 sm:px-4">
+                          <div className="flex justify-center">
+                            <NumberInput
+                              min="0"
+                              value={item.quantity}
+                              onValueChange={(n) =>
+                                updateQuantity(item.id, Math.floor(n))
+                              }
+                              className="w-16 sm:w-20 px-2 sm:px-3 py-2 text-center rounded-lg bg-background border border-card-border/10 focus:outline-none focus:border-primary-orange"
+                            />
+                          </div>
+                        </td>
+                        <td className="py-4 px-2 sm:px-4 text-right">
+                          ₹{item.offer_price}
+                        </td>
+                        <td className="py-4 px-2 sm:px-4 text-right font-bold">
+                          ₹{item.totalPrice.toFixed(2)}
+                        </td>
+                        <td className="py-4 px-2 sm:px-4 text-right">
+                          <button
+                            onClick={() => removeFromCart(item.id)}
+                            className="text-primary-red hover:text-primary-red/80 transition-colors"
+                          >
+                            <Trash2 />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+
+                {/* Mobile Card View */}
+                <div className="sm:hidden flex flex-col gap-3 p-2">
+                  {items.map((item) => (
+                    <div
+                      key={item.id}
+                      className="bg-white rounded-lg shadow flex px-3 py-2 relative"
+                    >
+                      <img
+                        src={
+                          item.image
+                            ? Array.isArray(item.image)
+                              ? item.image[0]
+                              : item.image?.split(",")[0]
+                            : item.image_url
+                              ? productImageUrl(item.image_url.split(",")[0])
+                              : "/assets/img/logo/logo-product.png"
+                        }
+                        alt={item.name}
+                        className="w-16 h-16 object-cover rounded-lg"
+                      />
+                      <div className="flex-1 min-w-0 pl-2 flex flex-col justify-between">
+                        {/* Product name and trash button */}
+                        <div className="flex items-start justify-between w-40">
+                          <div className="font-bold truncate">{item.name}</div>
+                          <button
+                            onClick={() => removeFromCart(item.id)}
+                            className="absolute top-2 right-1 text-primary-red hover:text-primary-red/80 transition-colors p-1"
+                            title="Remove"
+                            style={{ fontSize: "1rem", lineHeight: 1 }}
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                        <div className="text-xs text-text/60 truncate">
+                          {item.content}
+                        </div>
+                        {/* Quantity and price row */}
+                        <div className="flex items-center justify-between mt-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs text-text/60">Qty:</span>
+                            <NumberInput
+                              min="0"
+                              value={item.quantity}
+                              onValueChange={(n) =>
+                                updateQuantity(item.id, Math.floor(n))
+                              }
+                              className="w-12 px-2 py-1 text-center rounded-lg border border-card-border/10 focus:outline-none focus:border-primary-orange text-sm"
+                            />
+                          </div>
+                          <div className="flex flex-col items-end">
+                            <span className="text-xs text-text/60">
+                              ₹{item.offer_price}
+                            </span>
+                            <span className="font-bold text-base text-right">
+                              ₹{item.totalPrice.toFixed(2)}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Order Summary */}
+              <div className="w-full flex flex-col items-end">
+                <div className="bg-card/30 rounded-xl p-4 md:p-6 w-full max-w-sm">
+                  <h3 className="font-montserrat font-bold text-lg md:text-xl mb-4">
+                    Order Summary
+                  </h3>
+                  <div className="space-y-2 mb-4 text-sm md:text-base">
+                    <div className="flex justify-between">
+                      <span className="text-text/60">Actual Price</span>
+                      <span>
+                        <s>₹{totalActualAmount.toFixed(2)}</s>
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-text/60">You Saved (Discount)</span>
+                      <span>
+                        ₹{(totalActualAmount - totalAmount).toFixed(2)}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="border-t border-card-border/10 pt-4">
+                    <div className="flex justify-between font-bold text-lg">
+                      <span>Total</span>
+                      <span className="text-primary-orange">
+                        ₹{totalAmount.toFixed(2)}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Step Buttons */}
+              {!showDeliveryForm && !showPayment && !showAuthGate && (
+                <button
+                  onClick={() => {
+                    // Signing in is offered, never required. A customer who
+                    // has already chosen to carry on as a guest is not asked
+                    // again if they step back to change the cart.
+                    if (!user && !continuingAsGuest) {
+                      setShowAuthGate(true);
+                      return;
+                    }
+                    goToDeliveryForm();
+                  }}
+                  className="btn-primary w-full"
+                >
+                  Shipping Details
+                </button>
+              )}
+
+              {/* Sign in / sign up / skip. Skipping goes straight to the
+                  delivery form and the order is placed as a guest. */}
+              {showAuthGate && !showDeliveryForm && !showPayment && (
+                <div className="bg-card/30 rounded-xl p-6 mb-8">
+                  <h3 className="font-montserrat font-bold text-xl mb-2">
+                    Sign in to your account?
+                  </h3>
+                  <p className="text-sm text-text/70 mb-5">
+                    An account keeps your address ready for next time and lets
+                    you see all your orders in one place. It is not required —
+                    you can order as a guest and track it with your order number
+                    and phone.
+                  </p>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+                    <button
+                      onClick={() =>
+                        navigate("/login", {
+                          state: { from: window.location.pathname },
+                        })
+                      }
+                      className="btn-primary flex items-center justify-center gap-2"
+                    >
+                      <LogIn className="w-4 h-4" />
+                      <span>Sign in</span>
+                    </button>
+                    <button
+                      onClick={() =>
+                        navigate("/signup", {
+                          state: { from: window.location.pathname },
+                        })
+                      }
+                      className="flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-card hover:bg-card/70 border border-card-border/10 transition-colors"
+                    >
+                      <UserPlus className="w-4 h-4" />
+                      <span>Create account</span>
+                    </button>
+                  </div>
+
+                  <button
+                    onClick={() => {
+                      setContinuingAsGuest(true);
+                      setShowAuthGate(false);
+                      goToDeliveryForm();
+                    }}
+                    className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-lg text-primary-orange hover:bg-card/50 font-semibold transition-colors"
+                  >
+                    <span>Skip &amp; continue as guest</span>
+                    <ArrowRight className="w-4 h-4" />
+                  </button>
+
+                  <p className="text-xs text-text/50 text-center mt-2">
+                    Your cart is saved either way.
+                  </p>
+                </div>
+              )}
+
+              {/* Delivery Form */}
+              {showDeliveryForm && (
+                <div
+                  className="bg-card/30 rounded-xl p-6 mb-8"
+                  ref={cartAddressRef}
+                >
+                  <h3 className="font-montserrat font-bold text-xl mb-6">
+                    Delivery Details
+                  </h3>
+                  <form
+                    className="grid grid-cols-1 md:grid-cols-2 gap-6"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      handlePlaceOrder("offline");
+                      //setShowPayment(true);
+                    }}
+                  >
+                    {isStaff && (
+                      <div className="md:col-span-2">
+                        <label className="block text-sm font-medium mb-2">
+                          Find existing customer{" "}
+                          <span className="font-normal text-text/60">
+                            — by name, phone, city, district, address or pincode
+                          </span>
+                        </label>
+                        <CustomerPhoneLookup
+                          mode="any"
+                          value={customerSearch}
+                          onChange={setCustomerSearch}
+                          onSelect={fillFromCustomer}
+                          placeholder="e.g. Ravi Chennai, 600042, 97897…"
+                          className="w-full px-4 py-2 rounded-lg bg-background border border-card-border focus:outline-none focus:border-primary-orange"
+                        />
+                      </div>
+                    )}
+                    {isStaff && (
+                      <div className="md:col-span-2">
+                        <label className="block text-sm font-medium mb-2">
+                          Phone *{" "}
+                          <span className="font-normal text-text/60">
+                            — type to find an existing customer
+                          </span>
+                        </label>
+                        <CustomerPhoneLookup
+                          value={delivery.phone}
+                          onChange={(value) => setDeliveryField("phone", value)}
+                          onSelect={fillFromCustomer}
+                          required
+                          className="w-full px-4 py-2 rounded-lg bg-background border border-card-border focus:outline-none focus:border-primary-orange"
+                        />
+                      </div>
+                    )}
+                    <div>
+                      <label className="block text-sm font-medium mb-2">
+                        Name *
+                      </label>
+                      <input
+                        type="text"
+                        name="customerName"
+                        value={delivery.customerName}
+                        onChange={handleDeliveryDetailsChange}
+                        required
+                        className="w-full px-4 py-2 rounded-lg bg-background border border-card-border focus:outline-none focus:border-primary-orange"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-2">
+                        Email
+                      </label>
+                      <input
+                        type="email"
+                        name="email"
+                        // Controlled, so a customer picked by phone shows
+                        // their email here; defaultValue never updated.
+                        value={delivery.email || ""}
+                        onChange={handleDeliveryDetailsChange}
+                        className="w-full px-4 py-2 rounded-lg bg-background border border-card-border focus:outline-none focus:border-primary-orange"
+                      />
+                    </div>
+                    {!isStaff && (
+                      <div>
+                        <label className="block text-sm font-medium mb-2">
+                          Phone *
+                        </label>
+                        <input
+                          type="tel"
+                          name="phone"
+                          value={delivery.phone}
+                          onChange={handleDeliveryDetailsChange}
+                          required
+                          className="w-full px-4 py-2 rounded-lg bg-background border border-card-border focus:outline-none focus:border-primary-orange"
+                        />
+                      </div>
+                    )}
+                    <div>
+                      <label className="block text-sm font-medium mb-2">
+                        Alternate Phone No.
+                      </label>
+                      <input
+                        type="tel"
+                        name="alternatePhone"
+                        value={delivery.alternatePhone}
+                        onChange={handleDeliveryDetailsChange}
+                        className="w-full px-4 py-2 rounded-lg bg-background border border-card-border focus:outline-none focus:border-primary-orange"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-2">
+                        Address *
+                      </label>
+                      <input
+                        type="text"
+                        name="address"
+                        value={delivery.address}
+                        onChange={handleDeliveryDetailsChange}
+                        required
+                        className="w-full px-4 py-2 rounded-lg bg-background border border-card-border focus:outline-none focus:border-primary-orange"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-2">
+                        State *
+                      </label>
+                      <Select
+                        options={stateOptions}
+                        value={
+                          stateOptions.find(
+                            (opt) => opt.value === delivery.state,
+                          ) || null
+                        }
+                        onChange={(option) =>
+                          handleDeliveryDetailsChange({
+                            target: {
+                              name: "state",
+                              value: option?.value || "",
+                            },
+                          } as any)
+                        }
+                        isClearable
+                        placeholder="Select State"
+                        classNamePrefix="react-select"
+                        isDisabled={isProcessing}
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-2">
+                        District *
+                      </label>
+                      <Select
+                        options={districtOptions}
+                        value={
+                          districtOptions.find(
+                            (opt) => opt.value === delivery.district,
+                          ) ||
+                          // A district carried in from an old order that the
+                          // list spells differently is still the order's
+                          // district: shown, not silently blanked.
+                          (delivery.district
+                            ? { value: delivery.district, label: delivery.district }
+                            : null)
+                        }
+                        onChange={(option) =>
+                          handleDeliveryDetailsChange({
+                            target: {
+                              name: "district",
+                              value: option?.value || "",
+                            },
+                          } as any)
+                        }
+                        isClearable
+                        placeholder="Select District"
+                        isDisabled={!delivery.state || isProcessing}
+                        classNamePrefix="react-select"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-2">
+                        City *
+                      </label>
+                      <input
+                        type="text"
+                        name="city"
+                        value={delivery.city}
+                        onChange={handleDeliveryDetailsChange}
+                        required
+                        className="w-full px-4 py-2 rounded-lg bg-background border border-card-border focus:outline-none focus:border-primary-orange"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-2">
+                        Pincode *
+                      </label>
+                      <input
+                        type="text"
+                        name="pincode"
+                        value={delivery.pincode}
+                        onChange={handleDeliveryDetailsChange}
+                        required
+                        className="w-full px-4 py-2 rounded-lg bg-background border border-card-border focus:outline-none focus:border-primary-orange"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-2">
+                        Country
+                      </label>
+                      <input
+                        readOnly
+                        type="text"
+                        name="country"
+                        value={delivery.country}
+                        disabled
+                        className="w-full px-4 py-2 rounded-lg bg-background border border-card-border focus:outline-none focus:border-primary-orange"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-2">
+                        Referred By – Contact Number
+                      </label>
+                      <input
+                        type="tel"
+                        name="referralPhone"
+                        defaultValue=""
+                        onChange={handleDeliveryDetailsChange}
+                        className="w-full px-4 py-2 rounded-lg bg-background border border-card-border focus:outline-none focus:border-primary-orange"
+                      />
+                    </div>
+                    <div className="md:col-span-2">
+                      {isProcessing ? (
+                        <button
+                          type="submit"
+                          disabled
+                          className="btn-primary w-full"
+                        >
+                          {/* <Loader2 className="w-5 mr-2 animate-spin" /> */}
+                          Processing Order...
+                        </button>
+                      ) : (
+                        <div className="flex gap-3">
+                          <button type="submit" className="btn-primary w-full">
+                            Place Order
+                          </button>
+                          {["admin", "superadmin"].includes(
+                            userRole?.name || "",
+                          ) && (
+                            <button
+                              type="button"
+                              onClick={handleEstimateReport}
+                              className="px-4 py-2 rounded-lg bg-card hover:bg-card/70 transition-colors"
+                            >
+                              Estimate Report
+                            </button>
+                          )}
+                          {["admin", "superadmin"].includes(
+                            userRole?.name || "",
+                          ) && (
+                            <button
+                              type="button"
+                              onClick={handleSaveQuotation}
+                              disabled={isQuotationSaving || isProcessing}
+                              className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+                            >
+                              {isQuotationSaving
+                                ? "Saving..."
+                                : editingQuotationId
+                                  ? "Update Quote"
+                                  : "Save Quote"}
+                            </button>
+                          )}
+                          {["admin", "superadmin"].includes(
+                            userRole?.name || "",
+                          ) && (
+                            <button
+                              type="button"
+                              onClick={handleShareQuotation}
+                              disabled={isQuotationSaving || isProcessing}
+                              title="Saves the quotation and sends it on WhatsApp"
+                              className="flex items-center gap-2 px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700 transition-colors whitespace-nowrap"
+                            >
+                              <MessageCircle className="w-4 h-4" />
+                              Share Quote
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </form>
+                  {orderError && (
+                    <div className="md:col-span-2 mt-2 text-center text-red-600">
+                      {orderError}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {showPhoneVerification && verificationId && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+                  <div className="bg-white rounded-lg shadow-lg p-6 w-full max-w-sm relative">
+                    <button
+                      className="absolute top-2 right-2 text-gray-500 hover:text-red-500 text-2xl"
+                      onClick={() => setShowPhoneVerification(false)}
+                      aria-label="Close"
+                    >
+                      ×
+                    </button>
+                    <h2 className="text-xl font-bold mb-4 text-center">
+                      Verify Phone Number
+                    </h2>
+                    <div className="mb-4 text-center">
+                      <span className="text-sm text-text/70">
+                        Enter the OTP sent to
+                      </span>
+                      <div className="font-semibold">{verifyingPhone}</div>
+                      <button
+                        className="text-xs text-primary-orange underline mt-1"
+                        onClick={() => setVerifyingPhone("")}
+                      >
+                        Change phone number
+                      </button>
+                    </div>
+                    {verifyingPhone === "" ? (
+                      <input
+                        type="tel"
+                        placeholder="Enter new phone number"
+                        className="w-full px-3 py-2 border rounded mb-4"
+                        value={verifyingPhone}
+                        onChange={(e) => setVerifyingPhone(e.target.value)}
+                      />
+                    ) : (
+                      <>
+                        <input
+                          type="text"
+                          placeholder="Enter OTP"
+                          className="w-full px-3 py-2 border rounded mb-4"
+                          value={otp}
+                          onChange={(e) => setOtp(e.target.value)}
+                          maxLength={6}
+                        />
+                        {otpError && (
+                          <div className="text-red-500 text-xs mb-2">
+                            {otpError}
+                          </div>
+                        )}
+                        <button
+                          className="btn-primary w-full mb-2"
+                          disabled={isVerifying}
+                          onClick={async () => {
+                            setIsVerifying(true);
+                            setOtpError("");
+                            try {
+                              const { error } = await verifyOTP(
+                                verificationId,
+                                otp,
+                              );
+                              if (error) throw error;
+                              if (lastOrderId) {
+                                await supabase
+                                  .from("orders")
+                                  .update({ ph_verified: true })
+                                  .eq("id", lastOrderId);
+                              }
+                              setShowPhoneVerification(false);
+                              clearRecaptcha();
+                              celebrationConfetti();
+                              toast.success(
+                                "Phone number verified successfully!",
+                              );
+                              setOrderSuccess(true); // <-- Show success message in cart
+                              clearCart();
+                              // Do NOT call onClose();
+                            } catch (err: any) {
+                              setOtpError(err.message || "Invalid OTP");
+                              clearRecaptcha();
+                            } finally {
+                              setIsVerifying(false);
+                            }
+                          }}
+                        >
+                          {isVerifying ? "Verifying..." : "Verify"}
+                        </button>
+                        <button
+                          className="text-xs text-primary-orange underline"
+                          onClick={async () => {
+                            // Resend OTP logic
+                            const { verificationId: vId, error } =
+                              await signInWithPhone(verifyingPhone);
+                            if (error) {
+                              setOtpError("Failed to resend OTP");
+                            } else {
+                              setVerificationId(vId ?? "");
+                              toast.success("OTP resent!");
+                            }
+                          }}
+                        >
+                          Resend OTP
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </motion.div>
+  );
+}
